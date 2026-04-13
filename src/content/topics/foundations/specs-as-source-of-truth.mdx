@@ -1,0 +1,256 @@
+---
+title: Specs as Source of Truth
+section: foundations
+difficulty: 2
+readMinutes: 5
+hook: OpenAPI and AsyncAPI — your API's single source of truth
+takeaway: A machine-readable spec file is the contract your team, your tools, and your consumers can all rely on — write it before you write code.
+---
+
+## In a nutshell
+
+An API spec is a machine-readable file that describes exactly what your API does -- its endpoints, request formats, and response shapes. When you write this file before writing code, it becomes the single reference that your documentation, SDK generation, testing tools, and client teams all rely on. Without one, your API's "contract" is whatever your code happens to do today, and nobody finds out it changed until something breaks.
+
+## The situation
+
+Your API has Swagger docs, but they're auto-generated from code annotations. A developer adds a new query parameter and forgets the annotation. The docs now lie. A partner integrates against the documented behavior. Their integration breaks because the actual behavior diverged three sprints ago. Nobody noticed until production.
+
+The docs weren't the source of truth. The code was. And the code doesn't communicate intent.
+
+## Three specs you need to know
+
+The API ecosystem has converged on three specification formats, each covering a different communication model:
+
+- **OpenAPI** — REST APIs (request/response over HTTP)
+- **AsyncAPI** — event-driven APIs (messages, webhooks, pub/sub)
+- **Protocol Buffers (.proto)** — gRPC services (RPC over HTTP/2)
+
+Each one is a **machine-readable contract** — a file that describes what your API does, what it accepts, and what it returns. Tools can read these files to generate documentation, client SDKs, server stubs, mock servers, and contract tests. Humans can read them to understand the API without digging through code.
+
+## OpenAPI: the REST standard
+
+OpenAPI (formerly Swagger) is the dominant spec format for REST APIs. Here's a concrete snippet for a user endpoint:
+
+```yaml
+openapi: 3.1.0
+info:
+  title: User Service API
+  version: 1.0.0
+
+paths:
+  /users/{user_id}:
+    get:
+      operationId: getUser
+      summary: Get a user by ID
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: usr_8a3f
+      responses:
+        "200":
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  schemas:
+    User:
+      type: object
+      required: [id, name, email]
+      properties:
+        id:
+          type: string
+          example: usr_8a3f
+        name:
+          type: string
+          example: Alice Chen
+        email:
+          type: string
+          format: email
+          example: alice@example.com
+        role:
+          type: string
+          enum: [admin, engineer, viewer]
+        created_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: USER_NOT_FOUND
+        message:
+          type: string
+          example: No user found with the given ID
+```
+
+This single file tells you the endpoint, the parameter, the response shape, the possible values for `role`, the error format, and which fields are required. A tool can read this and generate a TypeScript client, a Python SDK, a mock server, or a test suite.
+
+<Callout type="aha" title="Spec-first vs code-first">
+  <p>There are two approaches: write the spec first and generate code from it (<strong>spec-first</strong>), or write the code first and generate the spec from annotations (<strong>code-first</strong>). Spec-first is harder to start but keeps the contract honest. Code-first is easier but the spec tends to drift. If you do code-first, at minimum run a CI check that the generated spec hasn't changed unexpectedly.</p>
+</Callout>
+
+## AsyncAPI: the event-driven standard
+
+AsyncAPI mirrors OpenAPI's structure but for message-based systems — webhooks, WebSockets, Kafka topics, AMQP queues. Here's a webhook event spec:
+
+```yaml
+asyncapi: 3.0.0
+info:
+  title: Order Events
+  version: 1.0.0
+
+channels:
+  orderCompleted:
+    address: /webhooks/orders
+    messages:
+      orderCompletedMessage:
+        $ref: "#/components/messages/OrderCompleted"
+
+operations:
+  onOrderCompleted:
+    action: send
+    channel:
+      $ref: "#/channels/orderCompleted"
+    summary: Notify when an order is completed
+
+components:
+  messages:
+    OrderCompleted:
+      headers:
+        type: object
+        properties:
+          X-Webhook-Signature:
+            type: string
+            description: HMAC-SHA256 signature for payload verification
+      payload:
+        type: object
+        required: [event, order_id, completed_at]
+        properties:
+          event:
+            type: string
+            const: order.completed
+          order_id:
+            type: string
+            example: ord_x7k9
+          total:
+            type: number
+            example: 49.98
+          currency:
+            type: string
+            example: USD
+          completed_at:
+            type: string
+            format: date-time
+```
+
+Without this spec, your webhook consumers are guessing at the payload shape. With it, they can generate types, validate payloads, and build integrations without trial and error.
+
+<Callout type="info" title="AsyncAPI is younger but growing fast">
+  <p>AsyncAPI reached 3.0 in 2024. The tooling ecosystem is smaller than OpenAPI's, but it covers the essentials: documentation generation, code generation, and schema validation. If you have event-driven APIs without a spec, you're already feeling the pain of undocumented message formats.</p>
+</Callout>
+
+## Protocol Buffers: the gRPC contract
+
+For gRPC services, the `.proto` file IS the spec. There's no separate specification layer — the contract and the code generation input are the same file.
+
+```protobuf
+syntax = "proto3";
+
+package users.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The user service definition
+service UserService {
+  // Get a user by ID
+  rpc GetUser (GetUserRequest) returns (User);
+
+  // List users with optional filtering
+  rpc ListUsers (ListUsersRequest) returns (ListUsersResponse);
+}
+
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  Role role = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_ENGINEER = 2;
+  ROLE_VIEWER = 3;
+}
+
+message ListUsersRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string role_filter = 3;
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  string next_page_token = 2;
+}
+```
+
+Run `protoc` against this file and you get typed client and server code in Go, Java, Python, TypeScript, Rust, or any other supported language. The contract is enforced at compile time — if you change the `.proto` file and a consumer hasn't updated, the build breaks. That's a feature.
+
+<Callout type="tip" title="Versioning in proto files">
+  <p>Notice the <code>package users.v1</code> — version the package, not the field numbers. Never reuse or change field numbers. Add new fields with new numbers. Remove fields by marking them <code>reserved</code>. This gives you backward-compatible evolution without breaking existing consumers.</p>
+</Callout>
+
+## What specs unlock
+
+A machine-readable spec is not just documentation. It's **infrastructure**:
+
+| Capability | How the spec enables it |
+|---|---|
+| **Documentation** | Generate interactive API docs (Swagger UI, Redoc, Stoplight) |
+| **Client SDKs** | Auto-generate typed clients in any language (openapi-generator, buf) |
+| **Server stubs** | Scaffold handler functions that match the contract |
+| **Mock servers** | Spin up a fake API from the spec for frontend development |
+| **Contract testing** | Validate that your implementation matches the spec in CI |
+| **Linting** | Enforce naming conventions and design rules automatically (Spectral) |
+| **Change detection** | Diff two spec versions to identify breaking changes before merging |
+
+<Callout type="warning" title="A spec nobody maintains is worse than no spec">
+  <p>A stale spec actively misleads consumers. If you adopt a spec, commit to keeping it accurate. The best way: make the spec the input to your build process (spec-first), or run a CI check that compares the generated spec against the committed one (code-first with guardrails).</p>
+</Callout>
+
+## Getting started
+
+If you're starting from zero:
+
+1. **Pick one endpoint** — your most important or most used
+2. **Write an OpenAPI spec for it** — just the YAML, no tooling yet
+3. **Paste it into [Swagger Editor](https://editor.swagger.io)** — see the generated docs instantly
+4. **Add it to your repo** — treat it like code: reviewed, versioned, tested
+5. **Add a CI check** — even a simple "does this YAML parse without errors" is a start
+
+You don't need to spec your entire API on day one. Start with one file, one endpoint, and build the habit.
+
+---
+
+*That wraps Section 1: Foundations. You now have the mental models — contracts, sync vs async, protocols, data formats, and specs. Next, we get practical: Section 2 dives into API design, starting with the API-first workflow.*

@@ -1,0 +1,302 @@
+---
+title: OWASP API Security Top 10
+section: security
+difficulty: 2
+readMinutes: 6
+hook: The vulnerabilities you're probably shipping right now
+takeaway: Most API breaches exploit authorization flaws, not cryptographic weaknesses — BOLA, excessive data exposure, and mass assignment are the low-hanging fruit attackers reach for first.
+---
+
+## In a nutshell
+
+The OWASP API Security Top 10 is a list of the most common and dangerous vulnerabilities found in APIs. Most of them are surprisingly simple -- like letting a user change an ID in the URL to access someone else's data, or returning sensitive fields the client doesn't need. These aren't exotic attacks; they're mistakes that happen when authorization checks are missing or when the API returns too much information.
+
+## The situation
+
+You run a penetration test on your API. The report comes back: an authenticated user can change the user ID in the URL and access other people's orders. The fix is a one-line authorization check. The breach it could have caused would have been a front-page story.
+
+The OWASP API Security Top 10 exists because these mistakes are everywhere. Here are the five you're most likely shipping. For the full list, see the [OWASP API Security Top 10](https://owasp.org/API-Security/).
+
+## 1. BOLA — Broken Object Level Authorization
+
+**The #1 API vulnerability, every year.** BOLA happens when your API checks whether the user is *authenticated* but not whether they're *authorized to access that specific resource*.
+
+### The attack
+
+```bash
+# Alice is authenticated and views her own order
+curl -H "Authorization: Bearer alice_token" \
+  https://api.store.com/api/orders/order_1001
+```
+
+```json
+{
+  "order_id": "order_1001",
+  "user_id": "usr_alice",
+  "items": [{ "name": "Keyboard", "price": 89.99 }],
+  "shipping_address": "123 Main St, Anytown"
+}
+```
+
+```bash
+# Alice changes the order ID — and gets Bob's order
+curl -H "Authorization: Bearer alice_token" \
+  https://api.store.com/api/orders/order_1002
+```
+
+```json
+{
+  "order_id": "order_1002",
+  "user_id": "usr_bob",
+  "items": [{ "name": "Monitor", "price": 349.99 }],
+  "shipping_address": "456 Oak Ave, Springfield"
+}
+```
+
+The server verified Alice's token. It never checked whether Alice owns order_1002.
+
+### The fix
+
+```python
+# Before: no ownership check
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str, user: User):
+    return db.orders.find_one({"order_id": order_id})
+
+# After: always filter by the authenticated user
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str, user: User):
+    order = db.orders.find_one({
+        "order_id": order_id,
+        "user_id": user.id       # ownership check
+    })
+    if not order:
+        raise HTTPException(status_code=404)
+    return order
+```
+
+<Callout type="aha" title="Why BOLA is everywhere">
+  <p>Most frameworks handle authentication for you (middleware, decorators, guards). Almost none handle object-level authorization automatically. Every endpoint that takes a resource ID in the URL is a potential BOLA vulnerability. You have to check ownership explicitly, every single time.</p>
+</Callout>
+
+**Defense:** use UUIDs instead of sequential IDs (harder to guess), always filter queries by the authenticated user's ID, and write integration tests that specifically try to access another user's resources.
+
+## 2. Broken Authentication
+
+Your login endpoint accepts unlimited attempts with no rate limiting, no account lockout, no CAPTCHA. An attacker brute-forces passwords at 1,000 attempts per second.
+
+### The attack
+
+```bash
+# Automated brute force — no rate limiting
+for password in $(cat rockyou.txt); do
+  curl -s -X POST https://api.example.com/auth/login \
+    -H "Content-Type: application/json" \
+    -d "{\"email\":\"ceo@target.com\",\"password\":\"$password\"}"
+done
+```
+
+```json
+// Server happily responds to each attempt
+{ "error": "Invalid credentials" }
+{ "error": "Invalid credentials" }
+{ "error": "Invalid credentials" }
+// ... 10,000 attempts later
+{ "access_token": "eyJhbG...", "user": { "role": "admin" } }
+```
+
+### The fix
+
+```http
+// Rate limiting response after 5 failed attempts
+HTTP/1.1 429 Too Many Requests
+Retry-After: 300
+Content-Type: application/json
+
+{
+  "error": "too_many_attempts",
+  "message": "Account temporarily locked. Try again in 5 minutes.",
+  "retry_after": 300
+}
+```
+
+**Defense:** rate limit login endpoints (5 attempts per 5 minutes per account), implement exponential backoff, use CAPTCHA after repeated failures, require MFA for sensitive accounts, and never reveal whether the email exists ("Invalid email or password" — always both).
+
+## 3. Excessive Data Exposure
+
+Your API returns the full database object because it's easier than creating a DTO. The response includes fields the client never needs — and shouldn't see.
+
+### The attack
+
+```bash
+curl -H "Authorization: Bearer user_token" \
+  https://api.example.com/api/users/me
+```
+
+```json
+{
+  "id": "usr_8a3f",
+  "email": "alice@example.com",
+  "name": "Alice Johnson",
+  "password_hash": "$2b$12$LJ3m4ys3Lk9zPcX...",
+  "ssn_last_four": "4589",
+  "internal_notes": "VIP customer, approved for credit increase",
+  "created_at": "2024-01-15T10:00:00Z",
+  "stripe_customer_id": "cus_abc123",
+  "failed_login_count": 3,
+  "mfa_secret": "JBSWY3DPEHPK3PXP"
+}
+```
+
+The frontend only displays name and email. But the API returns password hashes, internal notes, payment IDs, and MFA secrets. Any user with browser DevTools can see all of it.
+
+### The fix
+
+```json
+// Response with explicit field selection
+{
+  "id": "usr_8a3f",
+  "email": "alice@example.com",
+  "name": "Alice Johnson",
+  "created_at": "2024-01-15T10:00:00Z"
+}
+```
+
+**Defense:** never return the raw database object. Always map to a response DTO with explicitly listed fields. Review every API response in DevTools to see what you're actually sending. Use serialization allowlists, not blocklists — list the fields you want to include, don't try to exclude the dangerous ones.
+
+<Callout type="warning" title="The blocklist trap">
+  <p>If you exclude fields with a blocklist (<code>exclude: ["password_hash", "ssn"]</code>), every new sensitive column you add to the database will be exposed by default until someone remembers to add it to the blocklist. Use an allowlist: only the fields you explicitly include will be in the response.</p>
+</Callout>
+
+## 4. Mass Assignment
+
+Your API binds the entire request body to the database model. An attacker adds fields that the UI doesn't expose — and your server accepts them.
+
+### The attack
+
+```bash
+# Normal user registration
+curl -X POST https://api.example.com/api/users/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "attacker@example.com",
+    "password": "s3cur3pass",
+    "name": "Totally Normal User"
+  }'
+```
+
+```bash
+# Same request, with an extra field
+curl -X POST https://api.example.com/api/users/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "attacker@example.com",
+    "password": "s3cur3pass",
+    "name": "Totally Normal User",
+    "role": "admin"
+  }'
+```
+
+```json
+// Server blindly saves all fields
+{
+  "id": "usr_evil",
+  "email": "attacker@example.com",
+  "name": "Totally Normal User",
+  "role": "admin",
+  "created_at": "2026-04-13T10:00:00Z"
+}
+```
+
+The registration form doesn't have a "role" field. But the API accepted it because the server does `Object.assign(user, req.body)` without filtering.
+
+### The fix
+
+```javascript
+// Before: blindly accepts everything
+const user = await User.create(req.body);
+
+// After: explicit allowlist of accepted fields
+const user = await User.create({
+  email: req.body.email,
+  password: req.body.password,
+  name: req.body.name,
+  role: "viewer"  // always set by server, never from input
+});
+```
+
+**Defense:** use DTOs or schema validation (Zod, Joi, class-validator) to define exactly which fields each endpoint accepts. Never spread or assign the raw request body to a model. Treat any field not in the schema as suspicious.
+
+## 5. SSRF — Server-Side Request Forgery
+
+Your API accepts a URL parameter and fetches it server-side. An attacker points it at your internal network.
+
+### The attack
+
+```bash
+# Feature: generate a preview for a URL
+curl -X POST https://api.example.com/api/previews \
+  -H "Content-Type: application/json" \
+  -d '{ "url": "https://blog.example.com/article-42" }'
+```
+
+```bash
+# Attacker targets internal infrastructure
+curl -X POST https://api.example.com/api/previews \
+  -H "Content-Type: application/json" \
+  -d '{ "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/" }'
+```
+
+```json
+// Server fetches the URL from inside the VPC and returns AWS credentials
+{
+  "preview": {
+    "title": "",
+    "body": "{\"AccessKeyId\":\"AKIA...\",\"SecretAccessKey\":\"wJalr...\",\"Token\":\"IQoJb3...\"}"
+  }
+}
+```
+
+The server-side fetch has access to internal endpoints that the public internet cannot reach — cloud metadata APIs, internal services, databases on private IPs.
+
+### The fix
+
+```python
+# Validate and restrict URLs before fetching
+import ipaddress
+from urllib.parse import urlparse
+
+BLOCKED_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),  # cloud metadata
+    ipaddress.ip_network("127.0.0.0/8"),      # localhost
+]
+
+def is_safe_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    ip = socket.getaddrinfo(parsed.hostname, None)[0][4][0]
+    addr = ipaddress.ip_address(ip)
+    return not any(addr in net for net in BLOCKED_RANGES)
+```
+
+**Defense:** resolve the URL's IP before fetching and block private/internal ranges. Use an allowlist of permitted domains when possible. Run URL-fetching services in a sandboxed network segment with no access to internal infrastructure. Never return raw fetched content to the user.
+
+<Callout type="tip" title="Testing for these">
+  <p>Write integration tests that specifically attempt each of these attacks: access another user's resource (BOLA), submit extra fields (mass assignment), brute-force the login endpoint (broken auth). If your test suite doesn't include adversarial requests, you're only testing the happy path.</p>
+</Callout>
+
+## Checklist: OWASP API Security audit
+
+- [ ] Does every endpoint that takes a resource ID check ownership?
+- [ ] Are login and token endpoints rate-limited?
+- [ ] Am I returning only the fields the client needs?
+- [ ] Does input validation use an allowlist, not a blocklist?
+- [ ] Do any endpoints fetch user-provided URLs server-side?
+
+---
+
+*Next up: CORS — the mechanism every frontend developer has fought, and few actually understand.*

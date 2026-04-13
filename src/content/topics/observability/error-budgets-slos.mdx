@@ -1,0 +1,258 @@
+---
+title: Error Budgets & SLOs
+section: observability
+difficulty: 3
+readMinutes: 6
+hook: 100% uptime is the wrong target
+takeaway: SLOs give your team a concrete reliability target, and error budgets tell you how much risk you can spend on shipping features before you need to stop and stabilize.
+---
+
+## In a nutshell
+
+An SLO (Service Level Objective) is a specific reliability target for your API, like "99.9% of requests succeed" over a 30-day window. The error budget is the flip side: the 0.1% of allowed failures you can "spend" on shipping new features and taking risks. When the budget runs out, the team stops shipping features and focuses on stability. This turns the vague question "how reliable should we be?" into a concrete number that guides engineering decisions.
+
+## The situation
+
+Your VP of Engineering wants "five nines" — 99.999% availability. Sounds great in a slide deck. Here's what it actually means:
+
+| Target | Allowed downtime per year | Per month | Per day |
+|---|---|---|---|
+| 99% | 3 days, 15 hours | 7 hours 18 min | 14 min 24 sec |
+| 99.9% | 8 hours 46 min | 43 min 50 sec | 1 min 26 sec |
+| 99.95% | 4 hours 23 min | 21 min 55 sec | 43 sec |
+| 99.99% | 52 min 36 sec | 4 min 23 sec | 864 ms |
+| 99.999% | 5 min 15 sec | 26 sec | 86 ms |
+
+At five nines, you get 26 seconds of downtime per month. Total. Including deployments, DNS propagation, certificate renewals, and any dependency outage anywhere in your stack. Your database provider alone probably doesn't guarantee that.
+
+100% uptime isn't a target. It's a fantasy that prevents you from shipping anything.
+
+<Callout type="aha" title="The reliability-velocity tradeoff">
+  <p>Every deployment carries risk. Every new feature can introduce bugs. If your target is 100%, the logical conclusion is: never deploy anything. SLOs exist to make this tradeoff explicit — they define exactly how much unreliability you're willing to accept in exchange for the ability to move fast.</p>
+</Callout>
+
+## SLI, SLO, SLA: the three layers
+
+These terms get confused constantly. Here's the difference:
+
+**SLI (Service Level Indicator)** — a metric you measure. A number from your system.
+
+```json
+{
+  "sli": "availability",
+  "definition": "Percentage of HTTP requests that return a non-5xx status code",
+  "current_value": 0.9987,
+  "measurement_window": "30d"
+}
+```
+
+**SLO (Service Level Objective)** — a target you set for an SLI. An internal goal your team commits to.
+
+```json
+{
+  "slo": "availability",
+  "target": 0.999,
+  "window": "30d",
+  "sli_current": 0.9987,
+  "budget_remaining": -0.0003,
+  "status": "budget_exhausted"
+}
+```
+
+**SLA (Service Level Agreement)** — a contract with consequences. If you miss it, you owe the customer money (credits, refunds, penalties).
+
+The relationship: **SLI is what you measure. SLO is what you aim for. SLA is what you promise externally.** Your SLO should always be stricter than your SLA — if your SLA guarantees 99.9%, your SLO should target 99.95%. That gap is your safety margin.
+
+## Choosing your SLIs
+
+Not all metrics make good SLIs. The best SLIs measure what users actually experience, not what your server thinks is happening.
+
+| SLI | Definition | Why it works |
+|---|---|---|
+| **Availability** | % of requests that succeed (non-5xx) | Directly maps to "is the API working?" |
+| **Latency** | % of requests faster than a threshold | p99 < 500ms captures user-perceived speed |
+| **Correctness** | % of responses that return the right data | Catches bugs that don't cause errors |
+| **Throughput** | Requests served per second at target quality | Catches capacity problems |
+
+A practical SLO definition combining multiple SLIs:
+
+```yaml
+service: order-api
+slos:
+  - name: availability
+    sli: "proportion of HTTP requests with status < 500"
+    target: 99.9%
+    window: 30 days
+
+  - name: latency
+    sli: "proportion of HTTP requests completing within 500ms"
+    target: 99.0%
+    window: 30 days
+
+  - name: latency_critical
+    sli: "proportion of HTTP requests completing within 2000ms"
+    target: 99.9%
+    window: 30 days
+```
+
+Notice the two latency SLOs. The first says "99% of requests should be fast." The second says "almost no requests should be truly slow." Both are useful — they catch different problems.
+
+<Callout type="tip" title="Start with two SLOs">
+  <p>Don't try to define 15 SLOs on day one. Start with availability (non-5xx rate) and latency (p99 under a threshold). These two cover the vast majority of user-visible problems. Add more SLIs later when you have a specific reliability gap to close.</p>
+</Callout>
+
+## Error budgets: making the math work
+
+An error budget is the inverse of your SLO. If your SLO is 99.9% availability, your error budget is 0.1% — the amount of failure you're allowed before you breach your target.
+
+Here's the concrete math for a 30-day window:
+
+```json
+{
+  "service": "order-api",
+  "slo_target": 0.999,
+  "window": "30d",
+  "total_requests_in_window": 2592000,
+  "error_budget_total": 2592,
+  "errors_consumed": 1847,
+  "error_budget_remaining": 745,
+  "budget_consumed_percent": 71.2,
+  "days_remaining_in_window": 11,
+  "projected_status": "at_risk"
+}
+```
+
+The math: 2,592,000 requests * 0.001 (the 0.1% budget) = 2,592 allowed errors. You've used 1,847 of them with 11 days left. At this burn rate, you'll likely exceed the budget before the window ends.
+
+### Budget burn rate
+
+The burn rate tells you how fast you're consuming your error budget relative to the ideal pace.
+
+- **Burn rate 1.0** — you'll exactly exhaust the budget at the window end. Sustainable.
+- **Burn rate 2.0** — you're consuming budget twice as fast. You'll run out halfway through the window.
+- **Burn rate 10.0** — you have an active incident eating your budget. Act now.
+
+```json
+{
+  "burn_rate_1h": 8.4,
+  "burn_rate_6h": 3.2,
+  "burn_rate_24h": 1.7,
+  "alert_thresholds": {
+    "page_oncall": "burn_rate_1h > 14.4",
+    "create_ticket": "burn_rate_6h > 6.0",
+    "weekly_review": "burn_rate_24h > 1.0"
+  }
+}
+```
+
+The threshold of 14.4 means: at this burn rate sustained for 1 hour, you'd exhaust your entire 30-day error budget in roughly 2 days. At 6x for 6 hours, you'd exhaust it in 5 days. These thresholds come from Google's SRE practices — page for acute burns, ticket for sustained ones, review for slow drains.
+
+High short-term burn rate (1h) with lower long-term (24h) means a brief incident. High sustained burn rate means systemic unreliability.
+
+<Callout type="warning" title="Alerting on burn rate, not raw errors">
+  <p>Don't alert on "5xx count > 100." That fires during traffic spikes even when your error rate is fine. Alert on burn rate instead — it's normalized against your traffic volume and your SLO target. A burn rate of 10x means you'll blow through your monthly error budget in 3 days, regardless of whether you're handling 100 requests or 100,000.</p>
+</Callout>
+
+## When the budget is exhausted
+
+This is where error budgets become a management tool, not just a metric. When the budget runs out, the team has a structured response:
+
+### Budget remaining: operate normally
+
+Ship features. Take calculated risks. Deploy when ready. The budget exists to be spent.
+
+### Budget at risk (>80% consumed with time remaining)
+
+Slow down. Increase review rigor on deployments. Consider feature flags for new changes. Keep a closer eye on the burn rate.
+
+### Budget exhausted
+
+**Freeze feature deployments.** All engineering effort shifts to reliability:
+
+- Fix the issues that burned the budget
+- Add missing monitoring or alerts
+- Improve test coverage for the failure modes you hit
+- Write post-incident reviews for any incidents that consumed significant budget
+- Propose reliability improvements for the next sprint
+
+```yaml
+# Error budget policy
+policy:
+  budget_healthy:
+    feature_releases: "proceed normally"
+    deploy_cadence: "standard (daily)"
+    risk_tolerance: "moderate"
+
+  budget_at_risk:
+    feature_releases: "requires SRE review"
+    deploy_cadence: "reduced (every other day)"
+    risk_tolerance: "low"
+
+  budget_exhausted:
+    feature_releases: "frozen"
+    deploy_cadence: "reliability fixes only"
+    risk_tolerance: "zero"
+    required_actions:
+      - "post-incident review for all SLO-impacting events"
+      - "reliability improvements prioritized in next sprint"
+      - "budget resets at next window boundary"
+```
+
+This isn't punishment. It's a rational response. If you've used all your allowed unreliability, you need to earn it back before taking more risks. It gives engineers a clear, data-driven framework for saying "no, we need to fix things first" — backed by numbers, not feelings.
+
+<Callout type="info" title="Error budgets align incentives">
+  <p>Without error budgets, product teams push for features and SRE teams push for stability — and they fight. Error budgets make them allies. Product teams want a healthy budget so they can keep shipping. SRE teams want a healthy budget so they're not fighting fires. Both sides have a reason to care about reliability, and a shared metric to agree on.</p>
+</Callout>
+
+## Putting it all together
+
+```yaml
+# Complete SLO document for the Order API
+service: order-api
+owner: checkout-team
+review_cadence: weekly
+
+slis:
+  availability:
+    description: "Non-5xx responses / total responses"
+    good_event: "http_status < 500"
+    valid_event: "all HTTP requests (excluding health checks)"
+
+  latency:
+    description: "Responses under 500ms / total responses"
+    good_event: "response_time_ms < 500"
+    valid_event: "all HTTP requests (excluding health checks)"
+
+slos:
+  - sli: availability
+    target: 99.9%
+    window: 30d
+
+  - sli: latency
+    target: 99.0%
+    window: 30d
+
+error_budget_policy:
+  healthy: "ship features, deploy daily"
+  at_risk: "SRE review for deploys, reduce batch sizes"
+  exhausted: "feature freeze, reliability sprint"
+
+alerting:
+  page: "1h burn rate > 14.4x"
+  ticket: "6h burn rate > 6.0x"
+  review: "24h burn rate > 1.0x"
+```
+
+## Checklist: implementing SLOs
+
+- [ ] You've defined SLIs based on user-visible behavior, not server-side metrics
+- [ ] SLO targets are based on actual user needs, not aspirational numbers
+- [ ] Error budgets are calculated and visible to the team (dashboard, weekly report)
+- [ ] You have a written policy for what happens when the budget is exhausted
+- [ ] Alerts are based on burn rate, not raw error counts
+- [ ] Your SLO is stricter than your SLA (if you have one)
+- [ ] The team reviews SLO performance weekly, not just during incidents
+
+---
+
+*You now have the observability toolkit: metrics that don't lie, traces that cross boundaries, health checks that mean something, and reliability targets that balance speed with stability. Next section: lifecycle and developer experience — because your API will outlive your team.*

@@ -1,0 +1,267 @@
+---
+title: "Schema Evolution > Versioning"
+section: design
+difficulty: 3
+readMinutes: 7
+hook: "The best versioning strategy is not needing one"
+takeaway: Evolve your API schema through additive, non-breaking changes by default — reserve versioning as an escape hatch for genuinely breaking changes that can't be handled any other way.
+---
+
+## In a nutshell
+
+Your API will need to change over time, but changing it can break the apps that depend on it. Schema evolution is the practice of making changes in a way that doesn't break existing consumers -- typically by adding new fields instead of removing or renaming old ones. When you do this well, you can evolve your API for years without ever needing a "v2."
+
+## The situation
+
+Your API has been running for a year. You need to change how addresses are represented — the single `address` string field needs to become a structured object with `street`, `city`, `state`, and `zip` fields. You create `/v2/users`. Now you're maintaining two versions of every endpoint, every handler, every test. Some consumers are on v1, some on v2, some on the v1 endpoint for users but v2 for orders.
+
+Two years later, you have three versions. Nobody wants to maintain v1 anymore, but a partner integration depends on it. You can't shut it down. You can't move forward.
+
+Versioning solves a real problem, but it creates expensive new ones. The goal is to need it as rarely as possible.
+
+## Safe changes vs breaking changes
+
+The first step is understanding which changes break consumers and which don't.
+
+### Safe changes (non-breaking)
+
+These changes are **additive** — they add new capabilities without altering existing ones:
+
+```json
+// Before
+{
+  "id": "user_123",
+  "name": "Alice Chen",
+  "email": "alice@example.com"
+}
+
+// After — added fields, nothing removed or renamed
+{
+  "id": "user_123",
+  "name": "Alice Chen",
+  "email": "alice@example.com",
+  "avatarUrl": "https://cdn.example.com/avatars/user_123.jpg",
+  "role": "admin"
+}
+```
+
+Consumers that don't know about `avatarUrl` or `role` simply ignore them. No breakage.
+
+Other safe changes:
+- Adding a new **optional** request field
+- Adding a new **endpoint**
+- Adding a new **enum value** to a response field (with caveats)
+- Adding a new **HTTP method** to an existing resource
+- Widening a constraint (accepting strings up to 500 chars instead of 200)
+
+### Breaking changes (dangerous)
+
+These changes alter or remove something consumers depend on:
+
+```json
+// Before — consumers parse this field
+{
+  "id": "user_123",
+  "name": "Alice Chen",
+  "address": "123 Main St, Springfield, IL 62704"
+}
+
+// After — field restructured, old shape gone
+{
+  "id": "user_123",
+  "name": "Alice Chen",
+  "address": {
+    "street": "123 Main St",
+    "city": "Springfield",
+    "state": "IL",
+    "zip": "62704"
+  }
+}
+```
+
+Any consumer parsing `address` as a string will break.
+
+Other breaking changes:
+- **Removing** a response field
+- **Renaming** a field (`userName` to `user_name`)
+- **Changing a field's type** (string to object, number to string)
+- **Adding a new required** request field
+- **Removing** an endpoint
+- **Tightening** a constraint (reducing max length from 200 to 100)
+- **Changing** the meaning of a status code or error format
+
+<Callout type="aha" title="The additive-only rule">
+  <p>If every change you make is additive — new fields, new endpoints, new optional parameters — you never need a new version. Schema evolution is the practice of designing your changes to be additive by default, and reaching for versioning only when you truly can't avoid a break.</p>
+</Callout>
+
+## Postel's Law: be liberal in what you accept
+
+> "Be conservative in what you send, be liberal in what you accept."
+
+This principle, also known as the Robustness Principle, is the foundation of schema evolution. In practice:
+
+**As a producer (server):**
+- Accept fields you don't recognize and ignore them (don't reject requests with extra fields)
+- Accept both `"status": "active"` and `"status": "ACTIVE"` if you can reasonably normalize
+- Return only the fields you've documented — no bonus data that could become an accidental contract
+
+**As a consumer (client):**
+- Ignore fields you don't recognize in responses
+- Don't fail on unexpected fields — new ones will appear as the API evolves
+- Don't depend on field ordering in JSON objects
+
+```typescript
+// Fragile consumer — breaks when new fields appear
+const { id, name, email } = response.data;
+if (Object.keys(response.data).length !== 3) {
+  throw new Error("Unexpected response shape!");
+}
+
+// Robust consumer — takes what it needs, ignores the rest
+const { id, name, email } = response.data;
+// New fields? Don't care, don't break.
+```
+
+<Callout type="tip" title="Validate what you need, ignore what you don't">
+  <p>Both producers and consumers should practice this. If a consumer only uses <code>id</code>, <code>name</code>, and <code>email</code>, it should validate those three fields and ignore everything else. This makes it resilient to schema evolution.</p>
+</Callout>
+
+## Evolution strategies for common scenarios
+
+### Adding a field
+
+The simplest case — just add it. Make it optional in the schema. Consumers that don't know about it ignore it.
+
+### Restructuring a field
+
+Instead of changing the shape of `address`, add the new structured field alongside the old one:
+
+```json
+{
+  "id": "user_123",
+  "name": "Alice Chen",
+  "address": "123 Main St, Springfield, IL 62704",
+  "structuredAddress": {
+    "street": "123 Main St",
+    "city": "Springfield",
+    "state": "IL",
+    "zip": "62704"
+  }
+}
+```
+
+Deprecate the old `address` field. Set a sunset date. Remove it after consumers have migrated. This turns a breaking change into an additive one with a migration path.
+
+### Renaming a field
+
+Don't. Add the new field name, keep the old one, deprecate it:
+
+```json
+{
+  "userName": "alice_chen",
+  "username": "alice_chen"
+}
+```
+
+Return both during a transition period. Consumers migrate to the new field. Old field gets removed after the sunset date.
+
+### Changing enum values
+
+Adding a new enum value to a **response** field can break consumers with strict validation. Mitigate this by documenting that enums may be extended and consumers should handle unknown values gracefully:
+
+```typescript
+// Fragile — breaks when "archived" is added
+switch (project.status) {
+  case "active": /* ... */ break;
+  case "paused": /* ... */ break;
+  default: throw new Error(`Unknown status: ${project.status}`);
+}
+
+// Robust — handles unknown values gracefully
+switch (project.status) {
+  case "active": /* ... */ break;
+  case "paused": /* ... */ break;
+  default: /* treat as inactive or log a warning */ break;
+}
+```
+
+## When you actually need versioning
+
+Sometimes a breaking change is unavoidable — a fundamental rethinking of a resource model, a security fix that requires a different authentication flow, or a legal requirement that changes response shapes. When evolution isn't enough, you need versioning.
+
+### Option 1: URL path versioning
+
+```bash
+GET /v1/users/123
+GET /v2/users/123
+```
+
+**Pros:** Obvious, easy to route, easy to log and monitor.
+**Cons:** Pollutes URIs, encourages "big bang" version bumps, every client URL needs updating.
+
+### Option 2: Header versioning
+
+```bash
+GET /api/users/123
+Api-Version: 2
+
+# or
+GET /api/users/123
+Accept: application/vnd.example.v2+json
+```
+
+**Pros:** Clean URIs, version is metadata not address.
+**Cons:** Easy to forget, harder to test in a browser, harder to share URLs.
+
+### Option 3: Query parameter versioning
+
+```bash
+GET /api/users/123?version=2
+```
+
+**Pros:** Visible, easy to set.
+**Cons:** Mixes versioning with query parameters, easy to cache incorrectly.
+
+### Comparison
+
+| Approach | Visibility | URI cleanliness | Caching | Adoption |
+|---|---|---|---|---|
+| URL path (`/v2/`) | High | Low | Simple | Most common |
+| Header | Low | High | Needs Vary header | Growing |
+| Query param | Medium | Medium | Needs cache key | Rare |
+| Content negotiation | Low | High | Needs Vary header | Rare |
+
+<Callout type="warning" title="Versioning is expensive">
+  <p>Every version you ship is a version you maintain. Two versions means two sets of tests, two sets of handlers, two sets of documentation. Before creating v2, exhaust every evolution strategy first: additive fields, deprecation periods, parallel field names, feature flags.</p>
+</Callout>
+
+## The evolution-first workflow
+
+1. **Default to additive changes** — new fields, new endpoints, new optional parameters
+2. **Deprecate before removing** — use `Sunset` and `Deprecation` headers, give consumers a migration timeline
+3. **Document evolution policies** — tell consumers that new fields may appear in responses, that they should ignore unknown fields
+4. **Monitor usage** — track which consumers use deprecated fields, reach out before sunsetting
+5. **Version as a last resort** — when a breaking change is truly unavoidable, version the specific resource, not the entire API
+
+```bash
+# Deprecation headers in practice
+HTTP/1.1 200 OK
+Sunset: Sat, 01 Nov 2026 00:00:00 GMT
+Deprecation: true
+Link: <https://api.example.com/docs/migration-guide>; rel="sunset"
+
+{
+  "userName": "alice_chen",
+  "username": "alice_chen",
+  "address": "123 Main St, Springfield, IL 62704",
+  "structuredAddress": { "street": "123 Main St", "city": "Springfield", "state": "IL", "zip": "62704" }
+}
+```
+
+<Callout type="aha" title="Version resources, not APIs">
+  <p>If you must version, version the specific resource that changed (<code>/v2/users</code>), not the entire API. Most of your API probably didn't change — forcing consumers to migrate every endpoint from <code>/v1</code> to <code>/v2</code> is unnecessary pain.</p>
+</Callout>
+
+---
+
+*Next up: idempotency — the resilience pattern that makes retries safe and your API reliable under real-world network conditions.*

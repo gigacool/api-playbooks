@@ -1,0 +1,255 @@
+---
+title: Query Design
+section: design
+difficulty: 2
+readMinutes: 5
+hook: "Filtering, sorting, pagination, and sparse fieldsets done right"
+takeaway: Design your query interface with consistent parameter patterns — use cursor-based pagination by default, support sparse fieldsets to reduce payload size, and keep filter syntax simple until complexity demands otherwise.
+---
+
+## In a nutshell
+
+Most APIs need to let clients search, filter, sort, and page through lists of data. Query design is about choosing consistent patterns for these operations -- how clients filter results, which direction to sort, how to move through pages without missing items, and how to request only the fields they need. Getting this right once means every list endpoint in your API works the same way.
+
+## The situation
+
+Your list endpoint returns all 12,000 records. The mobile app chokes on the payload. You add a `limit` parameter. Then someone needs sorting. Then filtering by status. Then filtering by date range. Then combining filters.
+
+Six months in, your query parameters are an inconsistent mess: `?status=active&sortBy=created_at&sortDir=desc&limit=20&offset=40&fields=id,name`. There's no standard, and every endpoint handles these parameters slightly differently.
+
+Query design is the part of API design you don't think about until it's too late.
+
+## Filtering
+
+### Simple filters
+
+For basic equality filtering, use query parameters that map to field names:
+
+```bash
+GET /api/tasks?status=active
+GET /api/tasks?status=active&priority=high
+GET /api/tasks?assignee_id=user_123
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "task_1",
+      "title": "Review PR #42",
+      "status": "active",
+      "priority": "high",
+      "assigneeId": "user_123"
+    }
+  ],
+  "meta": { "total": 1 }
+}
+```
+
+### Structured filters
+
+When you need operators (greater than, less than, contains), use bracket syntax:
+
+```bash
+# Tasks created after a date with high priority
+GET /api/tasks?filter[status]=active&filter[priority]=high&filter[created_after]=2026-04-01
+
+# Orders above a certain amount
+GET /api/orders?filter[total_gte]=100&filter[status]=confirmed
+```
+
+The bracket syntax (`filter[field]`) namespaces your filters, keeping them separate from other query parameters like `sort` or `page`. It's the convention used by JSON:API and many well-designed APIs.
+
+<Callout type="tip" title="Start simple">
+  <p>Don't build a full query language on day one. Start with equality filters (<code>?status=active</code>). Add operators (<code>filter[total_gte]=100</code>) only when consumers actually need them. You can always add parameters — you can't remove them.</p>
+</Callout>
+
+## Sorting
+
+Use a `sort` parameter with field names. Prefix with `-` for descending:
+
+```bash
+# Newest first
+GET /api/tasks?sort=-created_at
+
+# By priority (ascending), then by creation date (newest first)
+GET /api/tasks?sort=priority,-created_at
+```
+
+```json
+{
+  "data": [
+    { "id": "task_3", "title": "Deploy hotfix", "priority": "high", "createdAt": "2026-04-13T10:00:00Z" },
+    { "id": "task_1", "title": "Review PR #42", "priority": "high", "createdAt": "2026-04-12T15:30:00Z" },
+    { "id": "task_2", "title": "Update docs", "priority": "medium", "createdAt": "2026-04-13T08:00:00Z" }
+  ]
+}
+```
+
+The `-` prefix convention is widely adopted and reads naturally: `sort=-created_at` means "sort by created_at, descending."
+
+<Callout type="warning" title="Don't allow sorting on unindexed columns">
+  <p>Every sortable field should have a database index. Allowing arbitrary sorting on any field is a performance footgun waiting to fire on a table with a million rows.</p>
+</Callout>
+
+## Pagination
+
+This is where most APIs get it wrong. There are two approaches, and one is almost always better.
+
+### Offset pagination
+
+The familiar pattern: `page` and `pageSize` (or `limit` and `offset`).
+
+```bash
+GET /api/tasks?page=3&page_size=20
+```
+
+```json
+{
+  "data": [ "...20 tasks..." ],
+  "meta": {
+    "total": 247,
+    "page": 3,
+    "pageSize": 20,
+    "totalPages": 13
+  }
+}
+```
+
+**The problem:** offset pagination breaks when data changes between requests. If a new task is inserted while a user is paging through results, they'll either skip a task or see a duplicate. It also gets slower on large datasets — `OFFSET 100000` means the database scans and discards 100,000 rows.
+
+### Cursor pagination
+
+Instead of a page number, use an opaque cursor — a Base64-encoded string that encodes the position in the result set (typically the last item's sort key + ID):
+
+```bash
+# First page
+GET /api/tasks?page[size]=20
+
+# Next page (using cursor from previous response)
+GET /api/tasks?page[size]=20&page[after]=eyJjcmVhdGVkQXQiOiIyMDI2LTA0LTEyVDE1OjMwOjAwWiIsImlkIjoidGFza18xMjMifQ
+```
+
+```json
+{
+  "data": [ "...20 tasks..." ],
+  "meta": {
+    "hasNextPage": true,
+    "hasPrevPage": true,
+    "startCursor": "eyJjcm...",
+    "endCursor": "eyJjcm..."
+  }
+}
+```
+
+The cursor is typically a Base64-encoded combination of the sort field and the item ID, ensuring stable positioning even when new items are inserted.
+
+### Navigation links (HATEOAS pagination)
+
+The real unlock with pagination is **not making the frontend build URLs at all**. Instead, return `_links` with pre-built navigation URLs:
+
+```json
+{
+  "data": [ "...20 tasks..." ],
+  "meta": {
+    "hasNextPage": true,
+    "hasPrevPage": true
+  },
+  "_links": {
+    "self":  { "href": "/api/tasks?page[size]=20&page[after]=abc123" },
+    "next":  { "href": "/api/tasks?page[size]=20&page[after]=def456" },
+    "prev":  { "href": "/api/tasks?page[size]=20&page[before]=abc123" },
+    "first": { "href": "/api/tasks?page[size]=20" }
+  }
+}
+```
+
+This is one of the few places where HATEOAS delivers real, practical value. The frontend just follows `_links.next` — it never constructs a pagination URL. This means:
+
+- **The backend owns pagination logic entirely** — you can change from offset to cursor without touching the frontend
+- **No cursor format leaks** — the frontend treats cursors as opaque strings
+- **Fewer bugs** — the frontend can't build a malformed pagination URL because it never builds one
+
+```typescript
+// Frontend pagination — no URL construction needed
+async function loadNextPage(currentResponse) {
+  if (!currentResponse._links.next) return null;
+  const res = await fetch(currentResponse._links.next.href);
+  return res.json();
+}
+```
+
+<Callout type="tip" title="Use _links for pagination, skip HATEOAS everywhere else">
+  <p>Full HATEOAS (adding <code>_links</code> to every resource for every possible action) is almost never worth the complexity. But for pagination specifically, <code>_links</code> with <code>next</code>/<code>prev</code>/<code>first</code>/<code>last</code> is genuinely useful and widely adopted. This is the pragmatic middle ground.</p>
+</Callout>
+
+<Callout type="aha" title="Default to cursor pagination">
+  <p>Cursor pagination is stable, performant, and works at any scale. Offset pagination is simpler to implement but breaks under real-world conditions. Use offset only for admin dashboards or reports where users genuinely need "go to page 7." For everything else, use cursors.</p>
+</Callout>
+
+### Comparison
+
+| Aspect | Offset | Cursor |
+|---|---|---|
+| Jump to specific page | Yes | No |
+| Stable across inserts/deletes | No | Yes |
+| Performance at scale | Degrades with offset size | Constant |
+| Implementation complexity | Lower | Moderate |
+| Total count available | Yes (but expensive) | Not inherently |
+| Best for | Admin UIs, reports | Feeds, infinite scroll, APIs |
+
+## Sparse fieldsets
+
+Not every consumer needs every field. Sparse fieldsets let consumers request only the fields they care about:
+
+```bash
+GET /api/tasks?fields=id,title,status
+```
+
+```json
+{
+  "data": [
+    { "id": "task_1", "title": "Review PR #42", "status": "active" },
+    { "id": "task_2", "title": "Update docs", "status": "done" }
+  ]
+}
+```
+
+Without sparse fieldsets, the same response might include `description`, `comments`, `attachments`, `activityLog`, and 15 other fields the mobile client never renders. That's wasted bandwidth and wasted parsing time.
+
+For APIs with related resources, use dot notation:
+
+```bash
+GET /api/tasks?fields=id,title&fields[assignee]=id,name,avatar
+```
+
+<Callout type="tip" title="Always return the ID">
+  <p>Even when a consumer requests <code>fields=name,email</code>, always include the <code>id</code> field. Consumers need it for updates, caching, and deduplication. It's such a universal requirement that it shouldn't need to be requested explicitly.</p>
+</Callout>
+
+## Putting it all together
+
+A well-designed query endpoint supports all four concerns in a single request:
+
+```bash
+GET /api/tasks?filter[status]=active&filter[priority]=high&sort=-created_at&fields=id,title,status,priority&page[size]=20&page[after]=cursor123
+```
+
+```json
+{
+  "data": [
+    { "id": "task_3", "title": "Deploy hotfix", "status": "active", "priority": "high" },
+    { "id": "task_1", "title": "Review PR #42", "status": "active", "priority": "high" }
+  ],
+  "meta": {
+    "hasNextPage": true,
+    "endCursor": "eyJjcmVhdGVk..."
+  }
+}
+```
+
+Clean, predictable, efficient. Every parameter follows a consistent pattern that consumers can learn once and apply across all your list endpoints.
+
+---
+
+*Next up: error handling and status codes — because returning 200 for errors is a crime against HTTP.*

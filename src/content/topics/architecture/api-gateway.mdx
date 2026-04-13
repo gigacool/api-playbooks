@@ -1,0 +1,308 @@
+---
+title: API Gateway
+section: architecture
+difficulty: 2
+readMinutes: 6
+hook: Routing, aggregation, and cross-cutting concerns in one place
+takeaway: An API gateway centralizes routing, authentication, rate limiting, and response aggregation so your services don't have to — but it's a single point of failure you need to operate carefully.
+---
+
+## In a nutshell
+
+An API gateway is a single front door that sits between your clients and all your backend services. Instead of clients needing to know about each service individually, they talk to one endpoint. The gateway handles routing, authentication, rate limiting, and can even combine responses from multiple services into a single call -- keeping cross-cutting concerns in one place instead of duplicated across every service.
+
+## The situation
+
+You have five microservices. Each one handles its own authentication. Each one implements its own rate limiting. Each one returns slightly different error formats. Your mobile app makes six requests on startup — one to each service — and the user stares at a spinner while each connection is established, authenticated, and resolved sequentially.
+
+You didn't plan for this. You just kept adding services.
+
+## What an API gateway actually does
+
+An API gateway sits between your clients and your backend services. Every external request passes through it. Instead of clients knowing about your internal service topology, they talk to one endpoint.
+
+```mermaid
+graph TD
+    Client[Client] --> GW[API Gateway]
+    GW --> Users[Users Service]
+    GW --> Orders[Orders Service]
+    GW --> Products[Products Service]
+```
+
+The gateway handles everything that isn't business logic: routing, auth, rate limiting, request transformation, response aggregation, logging.
+
+## Routing configuration
+
+At its core, a gateway maps external paths to internal services.
+
+Here's a simplified routing configuration. Real gateways have their own config format, but the concept is the same — map external paths to internal services:
+
+```json
+{
+  "routes": [
+    {
+      "path": "/api/users/**",
+      "upstream": "http://users-service:3001",
+      "strip_prefix": "/api",
+      "methods": ["GET", "POST", "PUT", "DELETE"]
+    },
+    {
+      "path": "/api/orders/**",
+      "upstream": "http://orders-service:3002",
+      "strip_prefix": "/api",
+      "methods": ["GET", "POST"]
+    },
+    {
+      "path": "/api/products/**",
+      "upstream": "http://products-service:3003",
+      "strip_prefix": "/api",
+      "methods": ["GET"]
+    }
+  ]
+}
+```
+
+A request to `GET /api/orders/ord_x7k9` hits the gateway, matches the second route, strips `/api`, and forwards to `http://orders-service:3002/orders/ord_x7k9`. The client has no idea `orders-service` exists.
+
+## Auth offload
+
+Without a gateway, every service validates JWTs independently. With a gateway, you do it once:
+
+```json
+{
+  "auth": {
+    "type": "jwt",
+    "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
+    "issuer": "https://auth.example.com",
+    "audiences": ["api.example.com"],
+    "exclude_paths": [
+      "/api/health",
+      "/api/auth/login",
+      "/api/auth/register"
+    ]
+  }
+}
+```
+
+The gateway validates the token and forwards the decoded claims as headers to downstream services:
+
+```bash
+# What the gateway forwards to the internal service
+GET /orders/ord_x7k9 HTTP/1.1
+Host: orders-service:3002
+X-User-Id: usr_8a3f
+X-User-Role: customer
+X-Request-Id: req_abc123
+```
+
+Internal services trust these headers because only the gateway can reach them. The network boundary is your trust boundary.
+
+<Callout type="tip" title="The trust boundary matters">
+  <p>This only works if internal services are not directly accessible from the outside. Use network policies, private subnets, or service mesh to enforce this. If anyone can bypass the gateway, your auth offload is theater.</p>
+</Callout>
+
+## Rate limiting offload
+
+Rate limiting at the gateway level protects all your services with a single configuration:
+
+```json
+{
+  "rate_limiting": {
+    "default": {
+      "requests_per_second": 100,
+      "burst": 20,
+      "key": "header:X-User-Id"
+    },
+    "overrides": [
+      {
+        "path": "/api/auth/login",
+        "requests_per_minute": 10,
+        "key": "client_ip"
+      },
+      {
+        "path": "/api/search/**",
+        "requests_per_second": 20,
+        "key": "header:X-User-Id"
+      }
+    ]
+  }
+}
+```
+
+When a client exceeds the limit:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 3
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1712937600
+
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Retry after 3 seconds.",
+  "retry_after": 3
+}
+```
+
+Your downstream services never see the rejected requests. They only process traffic that's within budget.
+
+## Request aggregation
+
+This is where gateways earn their keep. Your mobile app's home screen needs data from three services: user profile, recent orders, and product recommendations. Without aggregation, that's three round trips over a cellular connection.
+
+The gateway can aggregate them into one:
+
+```bash
+GET /api/home HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+```
+
+The gateway makes three internal requests in parallel:
+
+```mermaid
+sequenceDiagram
+    participant GW as API Gateway
+    participant U as Users Service
+    participant O as Orders Service
+    participant P as Products Service
+    Note over GW: GET /api/home
+    par Parallel internal calls
+        GW->>U: GET /users/usr_8a3f
+        U-->>GW: 200 OK (35ms)
+    and
+        GW->>O: GET /orders?user=usr_8a3f&limit=3
+        O-->>GW: 200 OK (52ms)
+    and
+        GW->>P: GET /recommendations/usr_8a3f
+        P-->>GW: 200 OK (41ms)
+    end
+```
+
+And stitches the results together:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Request-Id: req_abc123
+X-Response-Time: 55ms
+
+{
+  "user": {
+    "id": "usr_8a3f",
+    "name": "Alice Chen",
+    "avatar_url": "https://cdn.example.com/avatars/usr_8a3f.jpg",
+    "membership": "premium"
+  },
+  "recent_orders": [
+    {
+      "order_id": "ord_x7k9",
+      "status": "shipped",
+      "total": 49.98,
+      "created_at": "2026-04-10T14:32:00Z"
+    },
+    {
+      "order_id": "ord_w2m1",
+      "status": "delivered",
+      "total": 129.00,
+      "created_at": "2026-04-05T09:15:00Z"
+    },
+    {
+      "order_id": "ord_p4n8",
+      "status": "delivered",
+      "total": 34.50,
+      "created_at": "2026-03-28T18:42:00Z"
+    }
+  ],
+  "recommendations": [
+    {
+      "product_id": "prod_k3j7",
+      "name": "Wireless Keyboard Pro",
+      "price": 79.99,
+      "score": 0.94
+    },
+    {
+      "product_id": "prod_m9r2",
+      "name": "USB-C Hub 7-in-1",
+      "price": 45.00,
+      "score": 0.87
+    }
+  ]
+}
+```
+
+One request, one connection, one response. The total latency is the slowest internal call (52ms), not the sum of all three. On a 4G connection where each round trip adds 100-300ms of overhead, this is a massive UX improvement.
+
+<Callout type="aha" title="Aggregation vs BFF">
+  <p>Simple aggregation (merge three responses into one) belongs at the gateway. Complex, client-specific transformations (reshape data differently for mobile vs web) belong in a Backend-for-Frontend layer. Don't turn your gateway into a BFF.</p>
+</Callout>
+
+## Response transformation
+
+Gateways can also reshape responses. A common pattern: your internal services return verbose payloads, but your gateway strips out internal fields before sending them to external clients.
+
+Here's a conceptual transformation config (the exact format varies by gateway product — Kong, AWS, and Envoy each have their own syntax):
+
+```json
+{
+  "transformations": [
+    {
+      "path": "/api/users/**",
+      "response": {
+        "remove_fields": [
+          "internal_id",
+          "db_shard",
+          "feature_flags",
+          "created_by_admin"
+        ],
+        "rename_fields": {
+          "email_address": "email"
+        }
+      }
+    }
+  ]
+}
+```
+
+This keeps your internal data model from leaking through your public API.
+
+## The tradeoffs
+
+A gateway is powerful, but it's not free:
+
+| Benefit | Cost |
+|---|---|
+| Centralized auth, rate limiting, logging | Single point of failure |
+| Request aggregation reduces round trips | Added latency on every request (typically 1-5ms) |
+| Clients don't know about internal topology | One more thing to deploy, monitor, and scale |
+| Consistent error formats for all services | Gateway config becomes a bottleneck if managed centrally |
+| Easy canary deployments and traffic splitting | Complex debugging — "did the gateway transform this or did the service return it?" |
+
+<Callout type="warning" title="Don't put business logic in the gateway">
+  <p>The moment your gateway starts making decisions based on the content of request bodies, you've crossed a line. Gateways handle cross-cutting infrastructure concerns. Business logic belongs in services. If you find yourself writing conditional routing based on order amounts or user tiers, extract that into a service.</p>
+</Callout>
+
+## Gateway in practice
+
+Most teams don't build their own gateway. They use one of these:
+
+- **Kong** — Lua-based, plugin ecosystem, open source
+- **AWS API Gateway** — managed, integrates with Lambda and IAM
+- **Envoy** — high-performance proxy, often used as a sidecar in service mesh
+- **NGINX** — battle-tested reverse proxy, often extended for gateway use
+- **Traefik** — auto-discovers services in Docker/Kubernetes environments
+
+The choice depends on your infrastructure. Running Kubernetes? Envoy or Traefik. Serverless on AWS? API Gateway. Need maximum plugin flexibility? Kong.
+
+## Checklist: is a gateway right for you?
+
+- [ ] Do you have more than two backend services that external clients call directly?
+- [ ] Are you duplicating auth, rate limiting, or logging across services?
+- [ ] Do your clients make multiple requests that could be aggregated?
+- [ ] Can you afford the operational overhead of one more critical component?
+- [ ] Do you have monitoring in place to detect gateway failures quickly?
+
+---
+
+*Next up: Backend-for-Frontend — when a gateway isn't enough and different clients need fundamentally different APIs.*

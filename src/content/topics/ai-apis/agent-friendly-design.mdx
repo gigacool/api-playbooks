@@ -1,0 +1,300 @@
+---
+title: Designing Agent-Friendly APIs
+section: ai-apis
+difficulty: 3
+readMinutes: 6
+hook: Humans need good docs — agents need predictable schemas
+takeaway: An agent-friendly API has predictable schemas, structured errors, self-contained descriptions, scoped authorization, and minimal token cost — most of these also make it better for humans.
+---
+
+## In a nutshell
+
+When AI agents (not humans) consume your API, the rules change. Agents can't read documentation, can't interpret ambiguous responses, and can't exercise judgment about which endpoint to call. They need APIs that are predictable, concise, and explicit. The good news: most of what makes an API agent-friendly also makes it better for human developers. This topic covers the specific design choices that matter when your API consumer might be a machine.
+
+As with the rest of this section, agent-API interaction patterns are evolving rapidly. The principles here are durable — predictable schemas, structured errors, scoped auth — even as the specific tools and protocols continue to mature.
+
+## The situation
+
+A company opens their API to AI agents. Within a week, they discover three problems. First, agents are calling a deprecated endpoint because the LLM hallucinated a path that happened to still work. Second, a verbose endpoint returns 4KB of nested JSON per item — agents are burning through token budgets fetching data they don't need. Third, an agent with a user's full API key accidentally deletes a production resource because nothing scoped its permissions.
+
+These aren't AI bugs. They're API design gaps that humans worked around by reading docs and exercising judgment. Agents don't do either.
+
+## Agent-friendly vs agent-hostile
+
+Let's look at the same API endpoint designed two ways.
+
+### Agent-hostile: unpredictable, verbose, ambiguous
+
+```json
+{
+  "data": {
+    "user_info": {
+      "id": 42,
+      "fullName": "Alice Chen",
+      "e-mail": "alice@example.com",
+      "active?": true,
+      "meta": {
+        "last_login": "April 13, 2026 at 2:30 PM",
+        "preferences": {
+          "theme": "dark",
+          "notifications": { "email": true, "sms": false, "push": true, "digest": "weekly" },
+          "timezone": "America/New_York",
+          "locale": "en-US",
+          "accessibility": { "high_contrast": false, "font_size": "medium" }
+        },
+        "internal_flags": ["beta_tester", "premium_2024_q3", "migrated_v2"],
+        "avatar_variants": {
+          "small": "https://cdn.example.com/avatars/42_sm.jpg",
+          "medium": "https://cdn.example.com/avatars/42_md.jpg",
+          "large": "https://cdn.example.com/avatars/42_lg.jpg",
+          "original": "https://cdn.example.com/avatars/42_orig.jpg"
+        }
+      }
+    },
+    "msg": "OK"
+  }
+}
+```
+
+Problems for agents:
+- **Inconsistent naming:** `fullName` (camelCase), `e-mail` (kebab), `active?` (contains special char)
+- **Verbose payload:** preferences, internal flags, avatar variants — most of this is irrelevant for the task
+- **Human-formatted dates:** `"April 13, 2026 at 2:30 PM"` requires the model to parse natural language
+- **Flat status messages:** `"msg": "OK"` — no structured status, no error code
+- **Leaking internals:** `internal_flags` exposes implementation details
+
+### Agent-friendly: predictable, minimal, typed
+
+```json
+{
+  "id": "usr_42",
+  "name": "Alice Chen",
+  "email": "alice@example.com",
+  "is_active": true,
+  "last_login_at": "2026-04-13T14:30:00Z",
+  "timezone": "America/New_York"
+}
+```
+
+What changed:
+- **Consistent snake_case** — one naming convention, no surprises
+- **Minimal payload** — only the fields an agent is likely to need for most tasks
+- **ISO 8601 dates** — machine-parseable, no ambiguity about format
+- **Prefixed IDs** — `usr_42` is self-describing; `42` could be anything
+- **No internal leakage** — preferences and flags available via separate endpoints if needed
+
+<Callout type="aha" title="The design principle">
+  <p>An agent-friendly API is one where a language model can predict the shape of the response before seeing it. Consistent naming, predictable types, minimal payloads, and structured errors. Every surprise costs tokens and accuracy.</p>
+</Callout>
+
+## Structured errors agents can parse
+
+Humans read error messages. Agents need to parse error structures and decide what to do next. Unstructured errors cause agents to retry blindly, hallucinate fixes, or give up entirely.
+
+### Agent-hostile error
+
+```json
+{
+  "error": "Something went wrong. Please try again later or contact support at help@example.com."
+}
+```
+
+An agent can't extract the error type, can't determine if retrying would help, and certainly won't email support.
+
+### Agent-friendly error
+
+```json
+{
+  "error": {
+    "code": "slot_unavailable",
+    "message": "The requested time slot is already booked.",
+    "details": {
+      "requested_time": "2026-04-14T14:00:00Z",
+      "next_available": "2026-04-14T15:00:00Z"
+    },
+    "retryable": false
+  }
+}
+```
+
+Now the agent can:
+1. Read `code` to understand the error type programmatically
+2. Use `next_available` to suggest an alternative
+3. Check `retryable` to decide whether to retry or report back
+
+<Callout type="tip" title="Use machine-readable error codes">
+  <p>Define a finite set of error codes (<code>invalid_input</code>, <code>not_found</code>, <code>rate_limited</code>, <code>slot_unavailable</code>) and document them in your tool descriptions. Models can pattern-match on known codes far more reliably than they can interpret free-text error messages.</p>
+</Callout>
+
+## Documenting for both audiences
+
+Your API needs to serve human developers reading docs AND models reading tool definitions. Here's how to write descriptions that work for both:
+
+```json
+{
+  "name": "create_meeting",
+  "description": "Schedule a new calendar meeting. Returns the confirmed meeting object or an error. Possible error codes: 'slot_unavailable' (try a different time), 'participant_not_found' (check email address), 'quota_exceeded' (user has hit daily meeting limit, not retryable).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "Short title for the calendar event, e.g. 'Weekly sync with design team'"
+      },
+      "start_time": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Meeting start in ISO 8601 UTC. Must be in the future. Example: 2026-04-14T14:00:00Z"
+      },
+      "duration_minutes": {
+        "type": "integer",
+        "enum": [15, 30, 45, 60, 90],
+        "description": "Duration in minutes. Defaults to 30 if not specified."
+      },
+      "participants": {
+        "type": "array",
+        "items": { "type": "string", "format": "email" },
+        "minItems": 1,
+        "maxItems": 50,
+        "description": "Email addresses of participants. At least one required."
+      },
+      "notes": {
+        "type": "string",
+        "maxLength": 2000,
+        "description": "Optional agenda or notes. Supports plain text only, no HTML."
+      }
+    },
+    "required": ["title", "start_time", "participants"]
+  }
+}
+```
+
+Key patterns in this definition:
+- **Error codes listed in the tool description** — the model knows what errors to expect without needing external docs
+- **Examples inline** — `"e.g. 'Weekly sync with design team'"` gives the model a template
+- **Constraints as schema** — `minLength`, `maxLength`, `minItems`, `enum` prevent invalid arguments
+- **Format hints** — `"Must be in the future"` prevents past-date errors that the schema alone can't catch
+
+## Token cost: the hidden design constraint
+
+Every token your API sends back costs money and consumes the model's context window. This is a design constraint that doesn't exist for human consumers.
+
+| Response style | Token cost (approx.) | Impact |
+|---|---|---|
+| Minimal: 6 fields, flat JSON | ~50 tokens | Leaves room for reasoning |
+| Verbose: 30 fields, nested 3 levels deep | ~400 tokens | Fills context, increases cost |
+| Paginated list of 100 verbose items | ~40,000 tokens | Can exceed context window entirely |
+
+Practical strategies:
+
+- **Support sparse fieldsets** — let the caller specify which fields to return (`?fields=id,name,email`)
+- **Default to minimal responses** — return IDs and essential fields; let consumers expand with `?expand=preferences`
+- **Paginate aggressively** — default page size of 10-20, not 100
+- **Avoid deeply nested objects** — flatten where possible, or return references instead of embedded objects
+
+```json
+// Agent-hostile: embedded, verbose
+{
+  "meeting": {
+    "organizer": {
+      "id": "usr_42",
+      "name": "Alice Chen",
+      "email": "alice@example.com",
+      "department": { "id": "dept_7", "name": "Engineering", "floor": 3 }
+    }
+  }
+}
+
+// Agent-friendly: flat, reference-based
+{
+  "meeting": {
+    "organizer_id": "usr_42",
+    "organizer_name": "Alice Chen"
+  }
+}
+```
+
+<Callout type="warning" title="Hallucinated endpoints">
+  <p>Models will invent API endpoints that seem logical but don't exist. If your API has <code>/users</code> and <code>/meetings</code>, a model might confidently call <code>/users/usr_42/meetings</code> even if that endpoint doesn't exist. Mitigations: use tool definitions (not raw URLs), validate all inputs, and return clear 404 errors with suggestions for the correct endpoint.</p>
+</Callout>
+
+## Authorization for agent-driven access
+
+When an agent calls your API on behalf of a user, the security model gets more complex. The agent has capabilities the user never intended to delegate.
+
+### The wrong way: full API key
+
+```json
+{
+  "headers": {
+    "Authorization": "Bearer sk_live_full_access_key_abc123"
+  }
+}
+```
+
+This key can do everything the user can do. If the agent hallucinates a `DELETE /account` call, it succeeds.
+
+### The right way: scoped tokens with audit trails
+
+```json
+{
+  "headers": {
+    "Authorization": "Bearer agent_tok_calendar_readonly_xyz789"
+  }
+}
+```
+
+Design principles for agent authorization:
+
+| Principle | Implementation |
+|---|---|
+| **Least privilege** | Issue tokens scoped to specific operations: `calendar:read`, `calendar:write`, never `admin:*` |
+| **Time-limited** | Agent tokens expire in minutes or hours, not months |
+| **Action-specific** | A "book meeting" agent gets `meetings:create` — not `meetings:delete` |
+| **Auditable** | Every agent action logged with `agent_id`, `user_id`, `tool_called`, `arguments`, `result` |
+| **Revocable** | User can revoke an agent's access instantly without rotating their own credentials |
+| **Confirmation gates** | Destructive actions (`DELETE`, billing changes) require explicit user confirmation before execution |
+
+Here's what an agent audit log entry looks like:
+
+```json
+{
+  "timestamp": "2026-04-14T14:00:03Z",
+  "agent_id": "agent_claude_cal_01",
+  "user_id": "usr_42",
+  "action": "tools/call",
+  "tool": "create_meeting",
+  "arguments": {
+    "title": "Meeting with Alice",
+    "start_time": "2026-04-14T14:00:00Z",
+    "duration_minutes": 30,
+    "participants": ["alice@example.com"]
+  },
+  "result": "success",
+  "resource_created": "mtg_9f2a",
+  "token_scopes": ["calendar:read", "calendar:write"],
+  "token_expires_at": "2026-04-14T15:00:00Z"
+}
+```
+
+<Callout type="info" title="OAuth2 already supports this">
+  <p>You don't need a new auth system. OAuth2 scopes, short-lived access tokens, and refresh token rotation already provide the building blocks. The new part is treating the <strong>agent as a distinct client</strong> — not impersonating the user, but acting on their behalf with limited, auditable permissions.</p>
+</Callout>
+
+## Checklist: is your API agent-ready?
+
+- [ ] Consistent naming convention across all endpoints and fields?
+- [ ] ISO 8601 for all dates and times?
+- [ ] Structured error responses with machine-readable error codes?
+- [ ] Minimal default payloads with opt-in expansion?
+- [ ] Tool descriptions that are self-contained (no "see docs" references)?
+- [ ] Scoped authorization tokens for agent access?
+- [ ] Audit logging for all agent-initiated actions?
+- [ ] Confirmation gates for destructive operations?
+- [ ] Pagination defaults that won't blow up a context window?
+
+---
+
+*This wraps up The API Playbook. The throughline across all eight sections is the same: APIs are contracts, and every design decision is a commitment. The only thing that changed in this last section is the consumer — from a human developer to an AI agent. The principles hold. Build predictable interfaces, document your promises, and make breaking changes expensive to ship. Whether your consumer reads your docs or your JSON Schema, they deserve an API that works the way they expect.*

@@ -1,0 +1,231 @@
+---
+title: Health Checks & Readiness Probes
+section: observability
+difficulty: 1
+readMinutes: 4
+hook: Your API says it's healthy — but is it really?
+takeaway: A health check endpoint that always returns 200 is worse than having none — use liveness, readiness, and startup probes to tell your infrastructure what your service actually needs.
+---
+
+## In a nutshell
+
+A health check is an endpoint that tells your infrastructure whether your service is actually working, not just running. A basic health check that always says "I'm fine" is useless if the database connection is dead. Well-designed health checks verify that critical dependencies are reachable and tell load balancers to stop sending traffic to broken instances before users notice.
+
+## The situation
+
+Your Kubernetes cluster is routing traffic to all three replicas of your order service. The load balancer says they're all healthy — every one returns `{"status":"ok"}` on `/health`.
+
+But replica 2 lost its database connection five minutes ago. It's accepting HTTP requests, returning health checks, and then failing every actual operation with a 500. Your users are getting errors on roughly one in three requests. The health check is green. The service is broken.
+
+A health check that doesn't check anything isn't a health check. It's a lie.
+
+## The simplest health check (and why it's not enough)
+
+The most common health endpoint looks like this:
+
+```json
+GET /health HTTP/1.1
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "ok"
+}
+```
+
+This tells you one thing: the process is running and can handle HTTP requests. That's it. It doesn't tell you whether the service can actually do its job — connect to the database, reach the cache, write to the message queue.
+
+This is a **shallow health check**. It's fast, it never fails (unless the process is dead), and it gives you almost no useful signal.
+
+## Deep health checks: verify your dependencies
+
+A deep health check tests the things the service actually needs to function:
+
+```json
+GET /health HTTP/1.1
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "healthy",
+  "version": "2.4.1",
+  "uptime_seconds": 84320,
+  "checks": {
+    "database": {
+      "status": "healthy",
+      "latency_ms": 3,
+      "connection_pool": {
+        "active": 12,
+        "idle": 38,
+        "max": 50
+      }
+    },
+    "redis": {
+      "status": "healthy",
+      "latency_ms": 1
+    },
+    "payment_gateway": {
+      "status": "healthy",
+      "latency_ms": 45
+    },
+    "message_queue": {
+      "status": "degraded",
+      "latency_ms": 1200,
+      "note": "High latency — queue backlog detected"
+    }
+  }
+}
+```
+
+And when something is actually down:
+
+```json
+GET /health HTTP/1.1
+
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{
+  "status": "unhealthy",
+  "version": "2.4.1",
+  "uptime_seconds": 84320,
+  "checks": {
+    "database": {
+      "status": "unhealthy",
+      "error": "connection refused",
+      "last_successful_check": "2026-04-13T14:27:00Z"
+    },
+    "redis": {
+      "status": "healthy",
+      "latency_ms": 1
+    }
+  }
+}
+```
+
+Notice the **503 status code** when the service is unhealthy. The HTTP status is what load balancers and orchestrators actually read. The JSON body is for humans and dashboards.
+
+<Callout type="aha" title="The health check paradox">
+  <p>A deep health check is more useful but also more dangerous. If your health check queries the database on every call, and your load balancer checks health every 5 seconds across 10 replicas, that's 120 health-check queries per minute hitting your database. Design health checks to be fast and lightweight — check that a connection exists, don't run a complex query.</p>
+</Callout>
+
+## Three types of probes
+
+Kubernetes defines three probe types, and the distinction matters even if you're not using Kubernetes — the concepts apply to any orchestration or load-balancing setup.
+
+| Probe | Question it answers | What happens on failure |
+|---|---|---|
+| **Liveness** | Is the process stuck or deadlocked? | Kill and restart the container |
+| **Readiness** | Can this instance handle traffic right now? | Stop sending traffic (but don't kill it) |
+| **Startup** | Has the service finished initializing? | Keep waiting (don't check liveness yet) |
+
+### Liveness: "Should I restart this?"
+
+The liveness probe detects processes that are running but broken — deadlocked threads, infinite loops, corrupted state. If liveness fails, the orchestrator kills the container and starts a new one.
+
+**Keep it shallow.** A liveness probe should check "is the process responsive?" — not "is the database reachable." If you make liveness depend on an external dependency, a database outage will cause every replica to restart in a loop, making a bad situation catastrophic.
+
+### Readiness: "Should I send traffic here?"
+
+The readiness probe determines whether this specific instance can handle requests right now. If readiness fails, the load balancer removes the instance from the pool — but keeps it running. It might recover on its own.
+
+**This is where dependency checks belong.** A service that lost its database connection isn't ready for traffic, but it doesn't need to be killed. It should be taken out of rotation until the connection recovers.
+
+### Startup: "Is it done booting?"
+
+Some services take a long time to start — loading ML models, warming caches, running migrations. Without a startup probe, the liveness probe might kill the container before it finishes initializing.
+
+The startup probe tells the orchestrator: "Don't start checking liveness until I say I'm ready to be checked."
+
+<Callout type="tip" title="The probe separation rule">
+  <p>Liveness = shallow (process alive?). Readiness = deep (dependencies available?). Never mix them. A deep liveness probe turns every dependency failure into a restart storm.</p>
+</Callout>
+
+## Kubernetes probe configuration
+
+Here's how these probes look in a Kubernetes deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: order-service
+          image: order-service:2.4.1
+          ports:
+            - containerPort: 3000
+
+          # Is the process alive? (shallow — just checks HTTP response)
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          # Can it handle traffic? (deep — checks dependencies)
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+            timeoutSeconds: 5
+
+          # Has it finished starting up?
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: 3000
+            periodSeconds: 5
+            failureThreshold: 30  # 30 * 5s = 2.5 minutes to start
+            timeoutSeconds: 3
+```
+
+Key settings:
+
+- **`initialDelaySeconds`** — wait before the first check (gives the app time to boot)
+- **`periodSeconds`** — how often to check
+- **`failureThreshold`** — how many consecutive failures before taking action
+- **`timeoutSeconds`** — how long to wait for a response before counting it as a failure
+
+<Callout type="warning" title="The timeout trap">
+  <p>Set <code>timeoutSeconds</code> lower than <code>periodSeconds</code>. If your probe timeout is 10 seconds and your period is 10 seconds, a hanging health check means probes stack up and you lose all visibility into liveness. Keep timeouts at 3-5 seconds max.</p>
+</Callout>
+
+## Designing your health endpoints
+
+A practical setup uses separate endpoints for each probe type:
+
+| Endpoint | Probe type | What it checks |
+|---|---|---|
+| `GET /health/live` | Liveness | Returns 200 if the process is running |
+| `GET /health/ready` | Readiness | Returns 200 if all dependencies are reachable |
+| `GET /health/started` | Startup | Returns 200 once initialization is complete |
+| `GET /health` | Human/dashboard | Returns detailed JSON with all dependency statuses |
+
+The first three are for machines — keep their responses minimal and fast. The last one is for humans and monitoring dashboards — include the details.
+
+## Checklist: health check design
+
+- [ ] Liveness probe is shallow — no external dependency checks
+- [ ] Readiness probe verifies all critical dependencies (database, cache, queues)
+- [ ] Health check endpoints don't require authentication
+- [ ] Deep health checks are lightweight (connection ping, not full query)
+- [ ] Probe timeouts are shorter than probe intervals
+- [ ] Startup probe gives slow-starting services enough time to initialize
+- [ ] The detailed `/health` endpoint is not exposed publicly (internal network only)
+
+---
+
+*Next up: error budgets and SLOs — turning "how reliable should we be?" from a feeling into a number.*

@@ -1,0 +1,248 @@
+---
+title: API Linting & Style Guides
+section: lifecycle
+difficulty: 2
+readMinutes: 4
+hook: Automate consistency so you don't argue about it
+takeaway: A Spectral ruleset catches naming inconsistencies, missing fields, and style violations in your OpenAPI spec before code review — turning API standards into automated checks.
+---
+
+## In a nutshell
+
+API linting is like spell-check for your API design. It automatically scans your API specification and flags inconsistencies -- like endpoints that mix naming conventions, missing descriptions, or error responses in the wrong format. Instead of arguing about style in code reviews, you encode your team's rules once and let the linter enforce them on every change.
+
+## The situation
+
+Your API has 47 endpoints built by 6 different developers over 2 years. Some endpoints use `camelCase`, others use `snake_case`. Some return errors in `{ "error": "message" }`, others use `{ "message": "...", "code": 422 }`. Pagination is `?page=2` on one endpoint and `?offset=20&limit=10` on another. A new developer joins the team and asks "What's our API style?" Nobody has a clear answer.
+
+Inconsistency isn't a nitpick — it's a developer experience failure. Every time a consumer encounters a different pattern, they stop and think. That cognitive overhead compounds across your entire API surface.
+
+## Before and after: the cost of inconsistency
+
+### Without a style guide
+
+```yaml
+# Endpoint 1 (built in January)
+paths:
+  /api/getUsers:
+    get:
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userData:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+
+  # Endpoint 2 (built in March by a different developer)
+  /api/v2/orders/list:
+    post:
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+                  total_count:
+                    type: integer
+```
+
+Problems everywhere: verb in the URL (`getUsers`), inconsistent collection naming (`userData` vs `results`), POST for a read operation, `v2` in one path but not the other, mixed casing.
+
+### With a style guide enforced by linting
+
+```yaml
+paths:
+  /users:
+    get:
+      operationId: listUsers
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+
+  /orders:
+    get:
+      operationId: listOrders
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+```
+
+Same pattern everywhere. A developer who has used one endpoint can predict how every other endpoint works.
+
+<Callout type="aha" title="Consistency is a feature">
+  <p>A consistent API is a predictable API. When every endpoint follows the same patterns — naming, pagination, errors, casing — developers build a mental model once and reuse it everywhere. Inconsistency forces them to re-learn your API at every endpoint.</p>
+</Callout>
+
+## Spectral: automated API linting
+
+Spectral is an open-source linter for OpenAPI specs. You define rules, and it checks your spec against them in CI — the same way ESLint checks your JavaScript.
+
+### A practical ruleset
+
+```yaml
+# .spectral.yaml
+extends: ["spectral:oas"]
+
+rules:
+  # Naming conventions
+  paths-kebab-case:
+    description: Paths must use kebab-case
+    severity: error
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^(/[a-z][a-z0-9-]*(/{[a-zA-Z]+})?)+$"
+
+  # Every operation must have an operationId
+  operation-operationId:
+    description: Every operation must have a unique operationId
+    severity: error
+    given: "$.paths[*][get,post,put,patch,delete]"
+    then:
+      field: operationId
+      function: truthy
+
+  # Require descriptions
+  operation-description:
+    description: Every operation must have a description
+    severity: warn
+    given: "$.paths[*][get,post,put,patch,delete]"
+    then:
+      field: description
+      function: truthy
+
+  # Property naming convention
+  properties-snake-case:
+    description: Property names must use snake_case
+    severity: error
+    given: "$.components.schemas[*].properties[*]~"
+    then:
+      function: casing
+      functionOptions:
+        type: snake
+
+  # Error response format
+  error-response-schema:
+    description: Error responses must use the standard error schema
+    severity: warn
+    given: "$.paths[*][*].responses[?(@property >= '400' && @property < '600')].content.application/json.schema"
+    then:
+      field: "$ref"
+      function: pattern
+      functionOptions:
+        match: "#/components/schemas/Error"
+
+  # No verbs in paths
+  no-verb-in-path:
+    description: "Paths should not contain action verbs (use HTTP methods instead)"
+    severity: error
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: "/(get|create|update|delete|list|fetch|remove|add)([A-Z/]|$)"
+```
+
+### Running it
+
+```bash
+# Lint your OpenAPI spec
+npx @stoplight/spectral-cli lint openapi.yaml
+```
+
+```text
+openapi.yaml
+  17:5   error  paths-kebab-case       Path "/api/getUsers" must use kebab-case
+  18:9   error  no-verb-in-path        Path should not contain action verbs
+  23:11  error  operation-operationId  Every operation must have a unique operationId
+  31:13  error  properties-snake-case  Property "userData" must use snake_case
+  45:9   warn   operation-description  Every operation must have a description
+
+5 problems (4 errors, 1 warning)
+```
+
+Every violation is caught before a human reviewer has to point it out. No more style debates in PRs.
+
+## Building your style guide
+
+A style guide is the human-readable version of your ruleset. It documents the decisions behind the rules so new developers understand the "why," not just the "what."
+
+The decisions you should standardize:
+
+| Decision | Common choices |
+|---|---|
+| **Property casing** | `snake_case` (most common) or `camelCase` |
+| **Path casing** | `kebab-case` (almost universal) |
+| **Date format** | ISO 8601 (`2026-04-13T10:30:00Z`) |
+| **ID format** | Prefixed (`usr_8a3f`) or UUID (`550e8400-e29b-41d4...`) |
+| **Collection response shape** | `{ "data": [...], "pagination": {...} }` |
+| **Error response shape** | `{ "error": { "type": "...", "message": "...", "code": "..." } }` |
+| **Pagination style** | Cursor-based (`?cursor=...&limit=25`) or offset (`?offset=0&limit=25`) |
+| **Versioning** | Header (`API-Version: 2026-04-01`) or path (`/v1/...`) or none (schema evolution) |
+
+<Callout type="tip" title="Decide once, enforce forever">
+  <p>The specific choices matter less than making them consistently. <code>snake_case</code> vs <code>camelCase</code> is a preference. Mixing both in the same API is a bug. Pick a convention, document it in your style guide, encode it in Spectral, and never discuss it in a code review again.</p>
+</Callout>
+
+## Enforcing in CI
+
+The linter is only useful if it blocks bad specs from merging. Add it to your CI pipeline:
+
+```yaml
+# .github/workflows/api-lint.yml
+name: API Lint
+on:
+  pull_request:
+    paths:
+      - 'openapi.yaml'
+      - 'specs/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint OpenAPI spec
+        run: npx @stoplight/spectral-cli lint openapi.yaml --fail-severity error
+```
+
+The `--fail-severity error` flag means warnings are surfaced but don't block the merge. Errors do. This lets you introduce new rules as warnings first, then promote them to errors once the existing spec is cleaned up.
+
+<Callout type="warning" title="Don't lint everything at once">
+  <p>If you add Spectral to a project with 50 existing endpoints, you'll get hundreds of violations. Start with <code>extends: ["spectral:oas"]</code> (the built-in rules) and add custom rules one at a time. Fix violations incrementally. A linter that everyone ignores because it's too noisy is worse than no linter.</p>
+</Callout>
+
+---
+
+*Next up: backward compatibility and deprecation — because every API change is either additive or breaking, and the difference determines how much pain your consumers feel.*

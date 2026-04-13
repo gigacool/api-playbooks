@@ -1,0 +1,194 @@
+---
+title: Resource Modeling & URI Design
+section: design
+difficulty: 2
+readMinutes: 6
+hook: "The hardest part of API design that nobody teaches"
+takeaway: Model your API around resources (nouns) with consistent plural naming, keep nesting to two levels max, and reserve actions for the rare cases where CRUD doesn't fit.
+---
+
+## In a nutshell
+
+Resource modeling is about structuring your API around *things* (users, orders, projects) rather than *actions* (createUser, deleteOrder). Instead of inventing a unique endpoint for every operation, you use a predictable pattern: the URL identifies the thing, and the HTTP method (GET, POST, PUT, DELETE) says what you want to do with it. This makes your API consistent enough that developers can guess how new endpoints work without reading the docs.
+
+## The situation
+
+You're building an API for a project management tool. You need endpoints to create projects, add team members, assign tasks, and send notification emails. Your first instinct is to create endpoints like `/api/createProject`, `/api/addTeamMember`, `/api/sendEmail`.
+
+Three months later, you have 47 endpoints, each with a unique verb-noun combination. Nobody can guess what any endpoint does without reading the docs. The mobile team asks *"how do I update a team member?"* and you realize you never built that — you only built `addTeamMember` and `removeTeamMember`.
+
+This is what happens when you model APIs around **actions** instead of **resources**.
+
+## Resources are nouns, not verbs
+
+A resource is a thing — a noun that your API lets consumers interact with. The HTTP method provides the verb.
+
+| Action-based (avoid) | Resource-based (prefer) |
+|---|---|
+| `POST /api/createProject` | `POST /api/projects` |
+| `GET /api/getProject?id=123` | `GET /api/projects/123` |
+| `POST /api/updateProject` | `PUT /api/projects/123` |
+| `POST /api/deleteProject` | `DELETE /api/projects/123` |
+| `POST /api/addTeamMember` | `POST /api/projects/123/members` |
+| `POST /api/send-email` | `POST /api/emails` |
+
+The resource-based approach gives you a predictable, consistent pattern. Once a consumer understands `POST /resource` creates and `GET /resource/{id}` reads, they can guess 80% of your API without documentation.
+
+<Callout type="aha" title="The /send-email test">
+  <p>If your endpoint starts with a verb — <code>/send-email</code>, <code>/createUser</code>, <code>/processPayment</code> — you're building an RPC-style API disguised as REST. Reframe it: <code>POST /emails</code>, <code>POST /users</code>, <code>POST /payments</code>. The HTTP method is your verb.</p>
+</Callout>
+
+## Naming conventions that stick
+
+### Always use plural nouns
+
+```bash
+# Consistent — always plural
+GET  /api/projects          # list all projects
+POST /api/projects          # create a project
+GET  /api/projects/123      # get one project
+PUT  /api/projects/123      # update a project
+
+# Inconsistent — mixing singular and plural
+GET  /api/project/123       # one project
+GET  /api/projects          # all projects... wait, is it /project or /projects?
+```
+
+Plural nouns eliminate ambiguity. `/projects` is the collection, `/projects/123` is an item in the collection. Simple.
+
+### Use kebab-case for multi-word resources
+
+```bash
+# Yes
+GET /api/team-members
+GET /api/learning-paths
+
+# No
+GET /api/teamMembers
+GET /api/team_members
+GET /api/TeamMembers
+```
+
+URI paths are technically case-sensitive per RFC 3986, but kebab-case is the most readable convention and avoids casing ambiguity entirely.
+
+## Nesting: stop at two levels
+
+Resource nesting expresses relationships. But deep nesting creates long, rigid URLs that are painful to use.
+
+```bash
+# Good: one level of nesting — clear parent-child relationship
+GET /api/projects/123/tasks
+
+# Acceptable: two levels when it genuinely makes sense
+GET /api/projects/123/tasks/456/comments
+
+# Too deep: what are we even doing here?
+GET /api/organizations/1/departments/5/projects/123/tasks/456/comments/789/reactions
+```
+
+<Callout type="tip" title="The two-level rule">
+  <p>If you need more than two levels of nesting, promote the deeply nested resource to a top-level resource and use query parameters for filtering. <code>GET /comments?task_id=456</code> is cleaner than <code>GET /projects/123/tasks/456/comments</code>.</p>
+</Callout>
+
+### When to nest vs when to flatten
+
+```bash
+# Nest when the child resource doesn't make sense without the parent
+GET /api/projects/123/members     # members belong to a project
+POST /api/orders/456/line-items   # line items belong to an order
+
+# Flatten when the child resource has its own identity
+GET /api/tasks?project_id=123     # tasks can exist across projects in the UI
+GET /api/comments/789             # a comment can be linked to directly
+```
+
+## Resource payloads: what goes in, what comes out
+
+### Create request — accept the minimum
+
+```json
+POST /api/projects
+{
+  "name": "Q4 Launch",
+  "description": "Website redesign for Q4",
+  "teamId": "team_abc"
+}
+```
+
+Don't accept `id`, `createdAt`, `updatedAt`, or `status` in a create request. The server owns those fields.
+
+### Create response — return the full resource
+
+```json
+HTTP/1.1 201 Created
+Location: /api/projects/proj_789
+
+{
+  "id": "proj_789",
+  "name": "Q4 Launch",
+  "description": "Website redesign for Q4",
+  "teamId": "team_abc",
+  "status": "active",
+  "createdAt": "2026-04-13T10:30:00Z",
+  "updatedAt": "2026-04-13T10:30:00Z"
+}
+```
+
+Return the created resource so the consumer doesn't need a follow-up GET. Include the `Location` header pointing to the new resource.
+
+### Collection response — always wrap in an object
+
+```json
+GET /api/projects
+
+{
+  "data": [
+    { "id": "proj_789", "name": "Q4 Launch", "status": "active" },
+    { "id": "proj_790", "name": "Onboarding Revamp", "status": "draft" }
+  ],
+  "meta": {
+    "total": 47,
+    "page": 1,
+    "pageSize": 20
+  }
+}
+```
+
+Never return a bare JSON array (`[{...}, {...}]`). Wrapping in an object gives you room to add pagination metadata, links, or other top-level fields without a breaking change.
+
+<Callout type="warning" title="Bare arrays are a trap">
+  <p>If your list endpoint returns <code>[item, item, item]</code>, adding pagination later is a breaking change. Always return <code>&#123;"data": [...]&#125;</code> from day one.</p>
+</Callout>
+
+## When CRUD doesn't fit: action endpoints
+
+Sometimes a resource-based model is awkward. Triggering a complex workflow, running a calculation, or performing a bulk operation doesn't map cleanly to CRUD.
+
+For these cases, use a **sub-resource action**:
+
+```bash
+# Approve an order (state transition, not a simple field update)
+POST /api/orders/456/approve
+
+# Bulk archive old projects
+POST /api/projects/bulk-archive
+
+# Re-send an invoice email
+POST /api/invoices/789/resend
+```
+
+These are the exception, not the rule. If more than 20% of your endpoints are action-based, revisit your resource model.
+
+## Quick reference: URI design checklist
+
+- [ ] Resources are **plural nouns** (`/users`, not `/user`)
+- [ ] URIs use **kebab-case** (`/line-items`, not `/lineItems`)
+- [ ] Nesting stops at **two levels max**
+- [ ] IDs use **opaque identifiers** (`proj_789`, not auto-increment `3`)
+- [ ] Collections return **wrapped objects**, not bare arrays
+- [ ] Actions are **sub-resources** on the parent (`/orders/456/approve`)
+- [ ] No verbs in URIs unless it's an action endpoint
+
+---
+
+*Next up: REST design principles — HTTP methods, status codes, and the difference between PUT and PATCH.*

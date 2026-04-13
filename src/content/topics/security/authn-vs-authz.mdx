@@ -1,0 +1,181 @@
+---
+title: Authentication vs Authorization
+section: security
+difficulty: 1
+readMinutes: 6
+hook: API keys are NOT authentication
+takeaway: Authentication proves who you are, authorization decides what you can do — API keys do neither reliably, and confusing them is how breaches start.
+---
+
+## In a nutshell
+
+Authentication answers "who are you?" and authorization answers "what are you allowed to do?" They sound similar but work completely differently. An API key identifies which app is calling but doesn't prove who the user is. An OAuth token proves the user's identity and specifies what they've allowed. Confusing these two concepts is one of the most common causes of security holes in APIs.
+
+## The situation
+
+Your team builds an internal API. Someone suggests "just use API keys for auth." Three months later, a key leaks in a GitHub commit. You can't tell which user made which request, you can't revoke access per-user, and your audit log is useless. You have identification, not authentication — and now you're paying for the difference.
+
+## The three concepts everyone conflates
+
+Most engineers use "auth" as a blanket term. That's how vulnerabilities happen. There are three distinct concepts:
+
+| Concept | Question it answers | Analogy |
+|---|---|---|
+| **Identification** | "Who claims to be calling?" | Telling the bouncer your name |
+| **Authentication** | "Can you prove it?" | Showing your ID |
+| **Authorization** | "Are you allowed to do this?" | Checking the guest list |
+
+An API key is **identification**. It tells the server which application is calling. It does not prove that a specific human or service is who they claim to be. It's a shared secret with no identity binding.
+
+Every API request passes through three gates before it reaches your business logic:
+
+```mermaid
+flowchart LR
+    A["Request arrives"] --> B["Identification"]
+    B -->|"Who are you? API key"| C["Authentication"]
+    C -->|"Prove it. Verify token"| D["Authorization"]
+    D -->|"Are you allowed? Check permissions"| E["Access granted"]
+```
+
+<Callout type="aha" title="The distinction that matters">
+  <p>API keys identify the <strong>application</strong>. OAuth tokens authenticate the <strong>user</strong>. JWTs are signed <strong>assertions</strong> that can carry both identity and permissions. Treating an API key as authentication is like treating a business card as a passport.</p>
+</Callout>
+
+## API keys: identification, not authentication
+
+API keys are static strings shared between the client and server. They identify the caller but prove nothing about the user behind the request.
+
+```http
+GET /api/weather?city=paris HTTP/1.1
+Host: api.weather.example.com
+X-API-Key: YOUR_API_KEY_HERE
+```
+
+```json
+// What the server knows from this request:
+{
+  "client": "Acme Weather App",
+  "plan": "pro",
+  "rate_limit": "1000/hour",
+  "user": "???"
+}
+```
+
+The server knows which application is calling. It has no idea which user is behind it. If this key leaks, anyone can use it. There's no user-level audit trail, no session expiry, no multi-factor challenge.
+
+**When API keys are fine:** server-to-server calls where you trust both endpoints, rate limiting by client, public data APIs. Think Google Maps, weather APIs, analytics ingestion.
+
+**When API keys are dangerous:** anything involving user data, actions on behalf of a user, or access that should be revocable per-person.
+
+## OAuth tokens: actual authentication
+
+OAuth 2.0 tokens are issued by an authorization server after the user proves their identity. The token is scoped, time-limited, and tied to a specific user.
+
+```http
+GET /api/users/me/orders HTTP/1.1
+Host: api.store.example.com
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+```
+
+```json
+// What the server knows from this request:
+{
+  "user_id": "usr_8a3f",
+  "email": "alice@example.com",
+  "scopes": ["orders:read", "profile:read"],
+  "issued_at": "2026-04-13T10:00:00Z",
+  "expires_at": "2026-04-13T11:00:00Z",
+  "client_id": "mobile-app-ios"
+}
+```
+
+The server knows who the user is, what they're allowed to do, when the token expires, and which application requested it. If access needs to be revoked, you revoke the token — not the entire application's key.
+
+## JWTs: self-contained assertions
+
+A JWT (JSON Web Token) is a signed assertion. It carries claims about the user and is verified by checking the signature — no database lookup required.
+
+```json
+// Decoded JWT — three parts: header.payload.signature
+// Header
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "key-2026-04"
+}
+
+// Payload (claims)
+{
+  "sub": "usr_8a3f",
+  "email": "alice@example.com",
+  "roles": ["customer"],
+  "scopes": ["orders:read", "profile:read"],
+  "iss": "https://auth.store.example.com",
+  "aud": "https://api.store.example.com",
+  "iat": 1744538400,
+  "exp": 1744542000
+}
+
+// Signature
+// RS256(base64(header) + "." + base64(payload), privateKey)
+```
+
+The JWT is self-contained — the server can validate it without calling the auth server. But this is also its weakness: you can't revoke a JWT before it expires without maintaining a blocklist, which defeats the "no database lookup" advantage.
+
+<Callout type="warning" title="JWTs are not sessions">
+  <p>A JWT is a signed statement, not a session. Once issued, it's valid until it expires. If a user's permissions change or their account is compromised, the JWT keeps working until expiry. For sensitive operations, combine short-lived JWTs (5-15 minutes) with token introspection or a revocation list.</p>
+</Callout>
+
+## Token introspection: verifying at runtime
+
+When you need to check whether a token is still valid (not just properly signed), use token introspection:
+
+```bash
+curl -X POST https://auth.example.com/oauth/introspect \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "token=eyJhbGciOiJSUzI1NiIs..." \
+  -d "client_id=api-gateway" \
+  -d "client_secret=gw_secret_xyz789"
+```
+
+```json
+{
+  "active": true,
+  "sub": "usr_8a3f",
+  "client_id": "mobile-app-ios",
+  "scope": "orders:read profile:read",
+  "exp": 1744542000,
+  "iat": 1744538400,
+  "iss": "https://auth.example.com"
+}
+```
+
+If the token has been revoked, `active` returns `false`. This gives you real-time validity at the cost of a network call.
+
+## The comparison
+
+| | API Key | OAuth 2.0 Token | JWT | mTLS |
+|---|---|---|---|---|
+| **Identifies** | Application | User + Application | User + Application | Machine / Service |
+| **Proves identity** | No (shared secret) | Yes (issued after authn) | Yes (signed assertion) | Yes (certificate chain) |
+| **Expiry** | Manual rotation | Short-lived (minutes/hours) | Embedded in token | Certificate validity period |
+| **Revocation** | Regenerate key | Revoke at auth server | Hard (need blocklist) | Revoke certificate |
+| **User-level audit** | No | Yes | Yes | No (machine identity) |
+| **Complexity** | Low | Medium | Medium | High |
+| **Best for** | Public APIs, rate limiting | User-facing apps | Microservices, stateless APIs | Service mesh, zero-trust |
+
+<Callout type="tip" title="The practical rule">
+  <p>Use API keys for identification and rate limiting. Use OAuth tokens for user authentication. Use JWTs for stateless authorization between services. Use mTLS for service-to-service trust in zero-trust networks. Most production systems use at least two of these together.</p>
+</Callout>
+
+## Checklist: choosing your auth mechanism
+
+- [ ] Am I identifying an application or authenticating a user?
+- [ ] Do I need per-user audit trails?
+- [ ] How will I revoke access if a credential leaks?
+- [ ] Do my tokens have a reasonable expiry?
+- [ ] Am I transmitting credentials in headers, not URLs?
+
+---
+
+*Next up: OAuth2 and OpenID Connect — the flows, the tokens, and the mistakes everyone makes.*

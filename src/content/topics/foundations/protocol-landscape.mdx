@@ -1,0 +1,225 @@
+---
+title: The Protocol Landscape
+section: foundations
+difficulty: 1
+readMinutes: 6
+hook: REST is one tool, not the only one
+takeaway: REST, GraphQL, gRPC, WebSockets, SSE, and webhooks each solve different problems — picking the wrong one costs more than learning the right one.
+---
+
+## In a nutshell
+
+REST, GraphQL, gRPC, WebSockets, and webhooks are all different ways for systems to talk to each other. Each one is designed for different situations -- REST works great for public APIs, gRPC is fast for internal service communication, WebSockets handle real-time chat, and webhooks notify you when things happen. Picking the right one for each part of your system saves you from painful rewrites later.
+
+## The situation
+
+Your team builds a REST API for your mobile app. It works. Then product asks for real-time notifications. You bolt on polling. Then the data science team needs to pull massive datasets over internal networks. REST with JSON is now the bottleneck. Then the frontend team complains about over-fetching — they need 3 fields but you're returning 40.
+
+You don't have an API problem. You have a protocol mismatch problem.
+
+## The same operation, four ways
+
+Let's take a simple operation — **get a user profile** — and see how each major protocol handles it. Same data, different trade-offs.
+
+### REST (JSON over HTTP)
+
+```bash
+GET /api/users/usr_8a3f HTTP/1.1
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+```
+
+```json
+{
+  "id": "usr_8a3f",
+  "name": "Alice Chen",
+  "email": "alice@example.com",
+  "role": "engineer",
+  "department": "platform",
+  "avatar_url": "https://cdn.example.com/avatars/usr_8a3f.jpg",
+  "created_at": "2025-03-15T09:00:00Z"
+}
+```
+
+**What you get:** Human-readable, widely understood, cacheable, tooling everywhere. The server decides what fields to return.
+
+### GraphQL (query language over HTTP)
+
+```graphql
+query GetUser {
+  user(id: "usr_8a3f") {
+    name
+    email
+    role
+  }
+}
+```
+
+```json
+{
+  "data": {
+    "user": {
+      "name": "Alice Chen",
+      "email": "alice@example.com",
+      "role": "engineer"
+    }
+  }
+}
+```
+
+**What you get:** The client picks exactly the fields it needs. No over-fetching. One endpoint. But: no HTTP caching, more complex server implementation, and the N+1 query problem becomes your problem (a single GraphQL query can trigger hundreds of individual database calls if resolvers aren't carefully batched).
+
+### gRPC (Protocol Buffers over HTTP/2)
+
+```protobuf
+// user.proto — the contract
+service UserService {
+  rpc GetUser (GetUserRequest) returns (UserResponse);
+}
+
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message UserResponse {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  string role = 4;
+  string department = 5;
+  string avatar_url = 6;
+  string created_at = 7;
+}
+```
+
+```bash
+# Call with grpcurl
+grpcurl -d '{"user_id": "usr_8a3f"}' \
+  api.example.com:443 \
+  users.UserService/GetUser
+```
+
+**What you get:** Binary serialization (smaller payloads, faster parsing), strong typing from the `.proto` file, bi-directional streaming, code generation for any language. But: not browser-native, harder to debug (binary on the wire), less tooling for public APIs.
+
+### SOAP/XML (for contrast)
+
+```xml
+<!-- Request -->
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetUser xmlns="http://example.com/users">
+      <UserId>usr_8a3f</UserId>
+    </GetUser>
+  </soap:Body>
+</soap:Envelope>
+```
+
+```xml
+<!-- Response -->
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetUserResponse xmlns="http://example.com/users">
+      <Id>usr_8a3f</Id>
+      <Name>Alice Chen</Name>
+      <Email>alice@example.com</Email>
+      <Role>engineer</Role>
+      <Department>platform</Department>
+      <AvatarUrl>https://cdn.example.com/avatars/usr_8a3f.jpg</AvatarUrl>
+      <CreatedAt>2025-03-15T09:00:00Z</CreatedAt>
+    </GetUserResponse>
+  </soap:Body>
+</soap:Envelope>
+```
+
+**What you get:** Strict contracts (WSDL), enterprise tooling, WS-Security. But: verbose, painful to work with, declining ecosystem. You'll still encounter SOAP in banking, healthcare, and government integrations.
+
+<Callout type="aha" title="Same data, different philosophies">
+  <p>REST is resource-oriented (nouns + HTTP verbs). GraphQL is query-oriented (ask for what you need). gRPC is procedure-oriented (call a function). None is universally better — each optimizes for a different set of constraints.</p>
+</Callout>
+
+## The real-time protocols
+
+Request/response isn't always enough. When you need data pushed to the client, you have three options:
+
+### WebSockets
+
+Full-duplex, persistent TCP connection. Both sides can send messages anytime. Best for: chat, collaborative editing, gaming, trading platforms.
+
+```text
+// After WebSocket handshake
+Client: {"action": "subscribe", "channel": "user:usr_8a3f:notifications"}
+Server: {"type": "notification", "message": "New comment on your PR", "timestamp": "2026-04-13T14:00:00Z"}
+Server: {"type": "notification", "message": "Build #847 passed", "timestamp": "2026-04-13T14:02:15Z"}
+Client: {"action": "acknowledge", "notification_id": "notif_92a1"}
+```
+
+### Server-Sent Events (SSE)
+
+One-way stream from server to client over plain HTTP. Simpler than WebSockets, works through proxies and load balancers, auto-reconnects. Best for: dashboards, live feeds, progress updates.
+
+```text
+GET /api/events/user/usr_8a3f HTTP/1.1
+Accept: text/event-stream
+
+event: notification
+data: {"message":"New comment on your PR","timestamp":"2026-04-13T14:00:00Z"}
+
+event: notification
+data: {"message":"Build #847 passed","timestamp":"2026-04-13T14:02:15Z"}
+```
+
+### Webhooks
+
+Async HTTP callbacks — the server calls YOUR endpoint when something happens. No persistent connection. Best for: third-party integrations, payment notifications, CI/CD events.
+
+```http
+// GitHub sends this to your configured URL
+POST https://your-app.com/webhooks/github HTTP/1.1
+X-GitHub-Event: pull_request
+X-Hub-Signature-256: sha256=abc123...
+
+{
+  "action": "opened",
+  "pull_request": {
+    "number": 42,
+    "title": "Add user profile endpoint",
+    "user": { "login": "alicechen" }
+  }
+}
+```
+
+## Decision framework
+
+| Scenario | Best fit | Why |
+|---|---|---|
+| Public API for third-party developers | **REST** | Universal, self-documenting, cacheable, widest tooling |
+| Mobile app with complex, nested data needs | **GraphQL** | Clients fetch exactly what they need, reduce round trips |
+| Internal microservice-to-microservice calls | **gRPC** | Fast, strongly typed, streaming support, code generation |
+| Real-time bidirectional communication | **WebSockets** | Full-duplex, low latency, both sides can initiate |
+| Live dashboard or activity feed | **SSE** | Simple, HTTP-native, auto-reconnect, one-way is enough |
+| "Notify me when something happens" | **Webhooks** | No persistent connection, works across organizations |
+| Legacy enterprise integration | **SOAP** | When the other side requires it (and only then) |
+
+<Callout type="tip" title="The 80/20 rule">
+  <p>For most teams: REST for external APIs, gRPC for internal service-to-service, webhooks for async notifications. You can build a very successful product without ever touching GraphQL or WebSockets. Add complexity only when the simpler option demonstrably fails.</p>
+</Callout>
+
+## Mixing protocols is normal
+
+Real systems rarely use a single protocol. A typical architecture might look like:
+
+- **REST** — public API for customers and partners
+- **gRPC** — internal communication between backend services
+- **GraphQL** — BFF layer for the frontend team
+- **Webhooks** — notifying customers of async events
+- **SSE** — streaming updates to the admin dashboard
+
+The key is making a deliberate choice for each boundary in your system, not defaulting to REST everywhere because it's familiar.
+
+<Callout type="warning" title="Protocol mismatch is expensive">
+  <p>Using REST with JSON for high-throughput internal service calls? You're paying a serialization tax on every request. Using gRPC for a public API that browser clients need to call directly? You're forcing everyone through a proxy. Match the protocol to the boundary.</p>
+</Callout>
+
+---
+
+*Next up: data formats — JSON won the format war, but Protocol Buffers, XML, and others still have their place.*

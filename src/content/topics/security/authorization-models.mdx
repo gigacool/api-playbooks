@@ -1,0 +1,219 @@
+---
+title: Authorization Models
+section: security
+difficulty: 2
+readMinutes: 5
+hook: "RBAC, ABAC, scopes — picking the right one"
+takeaway: RBAC maps roles to permissions and works for most APIs, ABAC adds attribute-based conditions when roles aren't granular enough, and scopes limit what third-party apps can do on behalf of a user.
+---
+
+## In a nutshell
+
+Once you know who a user is, you need to decide what they can do. Authorization models are the different approaches for making that decision. Role-based (RBAC) assigns permissions through roles like "admin" or "editor." Attribute-based (ABAC) adds conditions like "only their own content" or "only during business hours." Relationship-based (ReBAC) checks connections like "is this person a member of this team?" Each fits different complexity levels.
+
+## The situation
+
+Your SaaS API has three user types: admin, editor, viewer. You implement RBAC. Then a customer asks: "Can editors only edit their own team's content, but only during business hours, and only if the content is in draft status?" Your role-based model doesn't have an answer for that — and bolting conditions onto roles turns into a mess of if-statements scattered across your codebase.
+
+You need to understand which authorization model fits which problem.
+
+## RBAC: role-based access control
+
+RBAC assigns **roles** to users, and **permissions** to roles. The user inherits all permissions from their assigned roles. Simple, widely understood, and sufficient for 80% of APIs.
+
+```json
+// Role definitions
+{
+  "roles": {
+    "admin": {
+      "permissions": [
+        "users:read", "users:write", "users:delete",
+        "content:read", "content:write", "content:delete",
+        "billing:read", "billing:write"
+      ]
+    },
+    "editor": {
+      "permissions": [
+        "content:read", "content:write",
+        "users:read"
+      ]
+    },
+    "viewer": {
+      "permissions": [
+        "content:read",
+        "users:read"
+      ]
+    }
+  }
+}
+```
+
+```json
+// User with roles
+{
+  "user_id": "usr_8a3f",
+  "email": "alice@example.com",
+  "roles": ["editor"],
+  "effective_permissions": [
+    "content:read", "content:write", "users:read"
+  ]
+}
+```
+
+When this user calls your API, you check: does their role grant the required permission?
+
+```http
+PUT /api/content/article-42 HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Content-Type: application/json
+
+{
+  "title": "Updated title",
+  "body": "New content..."
+}
+```
+
+The server decodes the JWT, sees `roles: ["editor"]`, resolves that to `content:write`, and allows the request.
+
+### RBAC in JWT claims
+
+Most APIs embed roles or permissions directly in the JWT to avoid a database lookup on every request:
+
+```json
+// JWT payload with RBAC claims
+{
+  "sub": "usr_8a3f",
+  "roles": ["editor"],
+  "permissions": ["content:read", "content:write", "users:read"],
+  "iss": "https://auth.example.com",
+  "exp": 1744542000
+}
+```
+
+<Callout type="tip" title="Roles vs permissions in the token">
+  <p>Embed <strong>roles</strong> if you want to resolve permissions at the API level (flexible, but requires the API to know the role-permission mapping). Embed <strong>permissions</strong> if you want the token to be self-contained (simpler checks, but the token grows with every permission and changes require re-issuing).</p>
+</Callout>
+
+**When RBAC works:** clear user categories, coarse-grained access (admin vs editor vs viewer), most B2B SaaS apps.
+
+**When RBAC breaks:** "editors can only edit their own content," "access depends on the resource's status," or any rule that depends on attributes of the resource, the environment, or the relationship between user and resource.
+
+## ABAC: attribute-based access control
+
+ABAC evaluates **policies** against **attributes** of the user, the resource, the action, and the environment. It's more powerful than RBAC but more complex.
+
+```json
+// ABAC policy: editors can update content they own, only in draft status
+{
+  "policy_id": "pol_content_edit",
+  "effect": "allow",
+  "action": "content:write",
+  "conditions": {
+    "all": [
+      { "field": "user.roles", "contains": "editor" },
+      { "field": "resource.owner_id", "equals": "user.id" },
+      { "field": "resource.status", "equals": "draft" }
+    ]
+  }
+}
+```
+
+```json
+// Another policy: admins can update any content, any time
+{
+  "policy_id": "pol_admin_override",
+  "effect": "allow",
+  "action": "content:write",
+  "conditions": {
+    "all": [
+      { "field": "user.roles", "contains": "admin" }
+    ]
+  }
+}
+```
+
+The authorization engine evaluates all matching policies. If any policy allows and none explicitly deny, the action proceeds.
+
+**When ABAC shines:** multi-tenant systems, resource-level ownership rules, time-based access, compliance requirements (data residency, classification levels).
+
+**When ABAC is overkill:** simple apps with clear user tiers. Don't build a policy engine when three if-statements would do.
+
+## ReBAC: relationship-based access control
+
+ReBAC (popularized by Google Zanzibar) defines access through **relationships** between entities. "Can Alice edit document X?" becomes "Is Alice an editor of document X, or an admin of the folder that contains document X?"
+
+```json
+// Relationship tuples (the core data model)
+[
+  { "user": "usr_alice", "relation": "editor", "object": "doc:report-q1" },
+  { "user": "usr_alice", "relation": "member", "object": "team:engineering" },
+  { "user": "team:engineering", "relation": "viewer", "object": "folder:eng-docs" },
+  { "user": "folder:eng-docs", "relation": "parent", "object": "doc:report-q1" }
+]
+```
+
+```json
+// Authorization check
+{
+  "query": "Is usr_alice allowed to view doc:report-q1?",
+  "resolution": [
+    "usr_alice -> editor of doc:report-q1 -> editors can view -> ALLOW"
+  ],
+  "result": true
+}
+```
+
+ReBAC is ideal for document-sharing systems (Google Drive, Notion), social networks, and any domain where access follows a graph of relationships. Tools like OpenFGA and SpiceDB implement this model.
+
+## OAuth scopes: delegated authorization
+
+Scopes are different from roles and permissions. They limit what a **third-party application** can do on behalf of a user — they don't define what the user can do.
+
+```json
+// Token with scopes (what the app is allowed to do)
+{
+  "sub": "usr_8a3f",
+  "roles": ["admin"],
+  "scope": "profile:read repos:read",
+  "client_id": "third-party-dashboard"
+}
+```
+
+Alice is an admin (she can do everything). But she authorized the third-party dashboard with only `profile:read repos:read`. Even though Alice is an admin, this token cannot delete repos — the scope doesn't allow it.
+
+The effective permission is the **intersection** of the user's permissions and the token's scopes:
+
+```
+effective_access = user_permissions AND token_scopes
+```
+
+<Callout type="aha" title="Scopes are not permissions">
+  <p>Scopes limit the application's access, not the user's access. A <code>repos:read</code> scope doesn't grant read access — it restricts the token to at most read access. The user must independently have read permission. This is why the GitHub OAuth consent screen says "This app is requesting access to..." — it's the user delegating a subset of their own authority.</p>
+</Callout>
+
+## The comparison
+
+| | RBAC | ABAC | ReBAC | Scopes |
+|---|---|---|---|---|
+| **Access based on** | User's role | Attributes of user, resource, context | Relationships between entities | Delegated app permissions |
+| **Granularity** | Coarse (role-level) | Fine (attribute-level) | Fine (relationship-level) | Delegation-level |
+| **Complexity** | Low | Medium-High | High | Low |
+| **Performance** | Fast (role lookup) | Medium (policy evaluation) | Medium (graph traversal) | Fast (scope check) |
+| **Best for** | B2B SaaS, internal tools | Compliance, multi-tenant | Document sharing, social | Third-party API access |
+| **Tools** | Any (built-in) | OPA, Cedar, Casbin | OpenFGA, SpiceDB, Ory Keto | OAuth 2.0 servers |
+
+<Callout type="warning" title="The most common mistake">
+  <p>Implementing authorization in the API handler instead of a dedicated layer. Authorization logic scattered across controllers is impossible to audit, easy to miss, and guaranteed to have inconsistencies. Centralize it — whether that's middleware, a policy engine, or a dedicated authorization service.</p>
+</Callout>
+
+## Checklist: choosing your authorization model
+
+- [ ] Do I have clear, stable user categories? Start with RBAC.
+- [ ] Do access rules depend on resource attributes or ownership? Add ABAC.
+- [ ] Is access defined by relationships (team member, document owner)? Consider ReBAC.
+- [ ] Am I building a third-party API? Use scopes to limit delegated access.
+- [ ] Is authorization logic centralized or scattered across handlers?
+
+---
+
+*Next up: OWASP API Security Top 10 — the vulnerabilities you're probably shipping right now.*

@@ -1,0 +1,182 @@
+---
+title: API-First Workflow
+section: design
+difficulty: 2
+readMinutes: 5
+hook: "Spec → codegen → implement, not the other way around"
+takeaway: Design your API contract before writing any code — it aligns teams faster, catches design flaws earlier, and enables parallel frontend/backend development.
+---
+
+## In a nutshell
+
+API-first means designing your API's interface before writing any backend code. You write a specification file that describes the endpoints, fields, and response shapes, then share it with your team for feedback. This catches design mistakes early, lets frontend and backend teams work in parallel, and prevents the painful rework that happens when the API shape doesn't match what consumers actually need.
+
+## The situation
+
+Your backend team builds an endpoint. The frontend team discovers the response shape doesn't match what they need. They ask for changes. The backend team pushes back — they've already written the database queries and service layer around that shape. Two sprints of rework follow.
+
+This happens because the API was designed *after* the implementation, not before it.
+
+## Code-first vs API-first
+
+Most teams work **code-first**: write the handler, decorate it with some framework annotations, and let the framework generate a spec (if one exists at all). The API shape is a side effect of the implementation.
+
+**API-first** flips this: you design the contract first, validate it with consumers, then implement against it.
+
+| Code-first | API-first |
+|---|---|
+| Implementation drives the contract | Contract drives the implementation |
+| Consumers discover the API after it ships | Consumers review the API before it's built |
+| Schema docs are generated (and often wrong) | Schema docs are the source of truth |
+| Frontend blocked until backend ships | Frontend and backend work in parallel |
+| Breaking changes discovered in integration | Breaking changes caught in review |
+
+<Callout type="aha" title="The real benefit">
+  <p>API-first isn't about tooling. It's about having a design conversation before anyone writes code. The spec is just the artifact that makes that conversation concrete.</p>
+</Callout>
+
+## The workflow in practice
+
+### Step 1: Write the spec
+
+Start with the contract. Here's an OpenAPI snippet for a task management API:
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Tasks API
+  version: 1.0.0
+paths:
+  /tasks:
+    post:
+      operationId: createTask
+      summary: Create a new task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+components:
+  schemas:
+    CreateTaskRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+        priority:
+          type: string
+          enum: [low, medium, high]
+          default: medium
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        priority:
+          type: string
+          enum: [low, medium, high]
+        status:
+          type: string
+          enum: [todo, in_progress, done]
+        createdAt:
+          type: string
+          format: date-time
+```
+
+This spec is reviewable. A frontend engineer can look at it and say *"I also need an `assigneeId` field"* before anyone writes a line of code.
+
+### Step 2: Generate types
+
+Run codegen against the spec. The output is the exact contract both sides agree to:
+
+```typescript
+// Generated from OpenAPI spec — do not edit manually
+
+export interface CreateTaskRequest {
+  title: string;
+  description?: string;
+  priority?: 'low' | 'medium' | 'high';
+}
+
+export interface Task {
+  id: string;
+  title: string;
+  description?: string;
+  priority: 'low' | 'medium' | 'high';
+  status: 'todo' | 'in_progress' | 'done';
+  createdAt: string;
+}
+```
+
+Both frontend and backend import these types. No drift. No "the API returns something slightly different from the docs."
+
+### Step 3: Implement against the types
+
+The backend implements the handler to satisfy the generated types:
+
+```typescript
+app.post('/tasks', async (req, res) => {
+  const body: CreateTaskRequest = req.body;
+
+  const task: Task = await taskService.create({
+    title: body.title,
+    description: body.description,
+    priority: body.priority ?? 'medium',
+    status: 'todo',
+  });
+
+  res.status(201).json(task);
+});
+```
+
+Meanwhile, the frontend team is already building against a mock server generated from the same spec — no blocking, no waiting.
+
+## What goes wrong without API-first
+
+The typical failure modes:
+
+1. **The "just add it" trap** — developers add fields to the response because they're easy to include, not because consumers need them. The response grows into a blob of everything the database knows.
+
+2. **The naming mismatch** — backend uses `created_at`, frontend expects `createdAt`. Discovered in integration testing. Someone writes a mapping layer. Everyone loses 2 hours.
+
+3. **The implicit contract** — there's no spec, so the real contract is "whatever the code does today." Any refactor can silently break consumers.
+
+<Callout type="tip" title="Start small">
+  <p>You don't need a full OpenAPI toolchain on day one. Start by writing a YAML file describing your endpoints before implementing them. Share it with your consumers in a pull request. That alone eliminates the most common design misalignments.</p>
+</Callout>
+
+## The tooling layer
+
+Once you commit to API-first, the ecosystem unlocks:
+
+- **Codegen** — generate TypeScript types, API clients, server stubs (`openapi-generator`, `orval`, `swagger-codegen`)
+- **Mock servers** — spin up a fake API from the spec for frontend development (`prism`, `mockoon`)
+- **Linting** — catch design inconsistencies automatically (`spectral`)
+- **Diff detection** — detect breaking changes between spec versions (`oasdiff`, `optic`)
+
+The spec becomes the single source of truth, and every tool in the pipeline reads from it.
+
+<Callout type="warning" title="Spec drift is real">
+  <p>If you generate a spec from code AND maintain a hand-written spec, they will drift. Pick one source of truth. API-first means the hand-written spec wins, and your CI pipeline validates that the implementation matches it.</p>
+</Callout>
+
+---
+
+*Next up: resource modeling and URI design — the part of API design where naming things is genuinely the hardest problem.*

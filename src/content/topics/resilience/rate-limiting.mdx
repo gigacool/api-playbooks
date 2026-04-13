@@ -1,0 +1,209 @@
+---
+title: Rate Limiting & Throttling
+section: resilience
+difficulty: 2
+readMinutes: 5
+hook: Protecting your API from your own users
+takeaway: Rate limiting protects your API from overload by capping request volume per consumer, and clear rate limit headers let clients self-regulate before they hit the wall.
+---
+
+## In a nutshell
+
+Rate limiting puts a cap on how many requests a client can make in a given time window. Go over the limit and you get a "slow down" response (HTTP 429) instead of your data. It protects your API from being overwhelmed -- whether by a bug, a traffic spike, or a single consumer hogging all the capacity.
+
+## The situation
+
+You launch your API. A partner integration goes live and starts polling your `/products` endpoint every 500 milliseconds for every product in their catalog — 200,000 requests per minute from a single API key.
+
+Your database connection pool is exhausted. Response times spike from 50ms to 8 seconds. Every other consumer of your API is affected. Your on-call engineer's phone starts buzzing.
+
+One enthusiastic consumer just took down your API for everyone.
+
+## Why rate limiting is non-negotiable
+
+Every production API needs rate limiting. Not because your users are malicious — most of the time they're not — but because:
+
+- **Buggy clients** can create accidental DDoS patterns (infinite retry loops, polling without backoff)
+- **Uneven usage** means one heavy consumer can starve everyone else
+- **Capacity is finite** — even auto-scaling has limits and costs money
+- **Downstream dependencies** have their own limits that you need to protect
+
+Rate limiting is the seatbelt of API design. You don't install it because you expect a crash — you install it because crashes happen.
+
+## The rate limit headers
+
+A well-behaved API tells consumers where they stand with standardized headers:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 847
+X-RateLimit-Reset: 1712847600
+
+{
+  "data": [
+    { "id": "prod_1", "name": "Widget A", "price": 29.99 }
+  ]
+}
+```
+
+| Header | Meaning |
+|--------|---------|
+| `X-RateLimit-Limit` | Maximum requests allowed in the window |
+| `X-RateLimit-Remaining` | Requests remaining in the current window |
+| `X-RateLimit-Reset` | Unix timestamp when the window resets |
+
+Some APIs use the IETF draft standard headers without the `X-` prefix (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`). Either convention works — just be consistent and document it.
+
+<Callout type="tip" title="Always send rate limit headers">
+  <p>Send rate limit headers on every response, not just on 429s. Smart clients use <code>X-RateLimit-Remaining</code> to self-throttle before they hit the limit. This is cheaper for both sides than waiting for a 429.</p>
+</Callout>
+
+## The 429 response
+
+When a consumer exceeds the limit, return a `429 Too Many Requests` with enough information for the client to recover:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 23
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1712847600
+
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "API rate limit exceeded. Maximum 1000 requests per hour.",
+    "limit": 1000,
+    "window": "1h",
+    "retry_after": 23
+  }
+}
+```
+
+The `Retry-After` header tells the client exactly how many seconds to wait. Include the same information in the JSON body — some HTTP clients make it easier to read the body than the headers.
+
+## Algorithms: how rate limits work
+
+### Token bucket
+
+Imagine a bucket that holds tokens. Each request consumes one token. Tokens refill at a steady rate. If the bucket is empty, the request is rejected.
+
+```
+Bucket capacity: 10 tokens
+Refill rate: 1 token per second
+
+t=0s   ██████████  10 tokens — send 6 requests → 4 remaining
+t=1s   █████       5 tokens (4 + 1 refilled)
+t=2s   ██████      6 tokens (5 + 1 refilled) — send 6 → 0 remaining
+t=3s   █           1 token (refilled) — burst is over, steady rate now
+```
+
+**Strengths:** Allows short bursts while enforcing a long-term average rate. This is what most APIs use.
+
+### Sliding window
+
+Count requests in a rolling time window. If the count exceeds the limit, reject.
+
+```
+Window: 60 seconds, Limit: 100 requests
+
+t=0s    Request #1   ✓  (1/100)
+t=15s   Request #50  ✓  (50/100)
+t=30s   Request #100 ✓  (100/100)
+t=31s   Request #101 ✗  REJECTED (100/100 in last 60s)
+t=61s   Request #102 ✓  (51/100 — earliest requests fell off the window)
+```
+
+**Strengths:** No burst allowance — strictly enforces the rate. Simpler to reason about.
+
+### Which one to use?
+
+| Algorithm | Burst tolerance | Complexity | Best for |
+|-----------|----------------|------------|----------|
+| Token bucket | Yes — up to bucket size | Medium | Most APIs (Stripe, GitHub) |
+| Sliding window | No — strict limit | Lower | APIs where bursts are dangerous |
+| Fixed window | Yes — at window boundaries | Lowest | Simple internal APIs |
+
+<Callout type="info" title="Fixed window gotcha">
+  <p>Fixed windows have a boundary problem: a client can send 100 requests at 11:59:59 and 100 more at 12:00:01 — 200 requests in 2 seconds while staying within a "100 per minute" limit. Sliding windows and token buckets avoid this.</p>
+</Callout>
+
+## Rate limiting strategies
+
+You need to decide **what** you're rate limiting by:
+
+### Per API key
+
+The most common approach. Each API key gets its own quota.
+
+```http
+GET /v1/products HTTP/1.1
+Authorization: Bearer sk_live_abc123
+```
+
+Rate limit: 1,000 requests/hour for this API key, regardless of which IP sends it.
+
+### Per user
+
+Rate limit by authenticated user ID. Useful when multiple API keys belong to the same account.
+
+### Per IP address
+
+Used for unauthenticated endpoints (login, registration). Less reliable because many users share IPs (corporate NATs, VPNs).
+
+### Per endpoint
+
+Different endpoints have different costs. A `GET /users` that hits a cache is cheap. A `POST /reports/generate` that runs a 10-second query is expensive. Set different limits accordingly.
+
+Different endpoints have different computational costs. Set limits accordingly:
+
+```text
+GET  /v1/products        → 5,000 requests/hour
+GET  /v1/products/:id    → 5,000 requests/hour
+POST /v1/orders          → 500 requests/hour
+POST /v1/reports/generate → 10 requests/hour
+```
+
+### Tiered limits by plan
+
+Different pricing tiers get different limits — this is also a monetization lever:
+
+Here's how a typical tier configuration looks — each plan maps to a rate limit and burst allowance:
+
+```json
+{
+  "plans": {
+    "free":       { "requests_per_hour": 100,   "burst": 10 },
+    "starter":    { "requests_per_hour": 1000,  "burst": 50 },
+    "business":   { "requests_per_hour": 10000, "burst": 200 },
+    "enterprise": { "requests_per_hour": 100000, "burst": 1000 }
+  }
+}
+```
+
+## Rate limiting vs throttling
+
+These terms are often used interchangeably, but there's a useful distinction:
+
+- **Rate limiting** — hard cap: once exceeded, requests are rejected with 429
+- **Throttling** — soft cap: once exceeded, requests are queued or slowed down instead of rejected
+
+Throttling is friendlier to consumers but harder to implement. Most APIs use hard rate limits with clear 429 responses and let the client handle the pacing.
+
+## Checklist: rate limiting implementation
+
+- [ ] Define limits per endpoint based on cost and expected usage
+- [ ] Choose a strategy: per-key, per-user, per-IP, or combination
+- [ ] Return `X-RateLimit-*` headers on every response
+- [ ] Return `429` with `Retry-After` when limits are exceeded
+- [ ] Include rate limits in your API documentation
+- [ ] Set up monitoring to detect consumers approaching their limits
+- [ ] Consider tiered limits for different pricing plans
+- [ ] Apply rate limits at the API gateway level, not in each service
+
+---
+
+*Next up: caching strategies — because the cheapest request is the one you never make.*

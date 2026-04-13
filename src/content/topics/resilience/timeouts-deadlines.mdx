@@ -1,0 +1,260 @@
+---
+title: Timeouts & Deadline Propagation
+section: resilience
+difficulty: 3
+readMinutes: 5
+hook: No timeout means infinite wait — and a cascading failure
+takeaway: Every outbound call needs a timeout, and in service chains the deadline must propagate so downstream services know how much time they have left before the work becomes pointless.
+---
+
+## In a nutshell
+
+A timeout is a limit on how long your code will wait for an API response. Without one, a single unresponsive service can hold your application hostage indefinitely -- threads pile up, memory fills, and everything grinds to a halt. In systems where multiple services call each other, you also need to pass the remaining time budget downstream so that services deep in the chain know when to stop working because the user has already given up.
+
+## The situation
+
+Service A receives a request from a user. It calls Service B, which calls Service C, which calls a third-party geocoding API. The geocoding API hangs — no response, no error, just silence.
+
+Service C waits. Service B waits for Service C. Service A waits for Service B. The user stares at a spinner for 30 seconds, gives up, and closes the tab.
+
+But the request chain is still running. Service C finally gets a response from the geocoding API at the 45-second mark and dutifully passes it back up. Service B processes it, passes it to Service A, which tries to respond to the user — but the connection is already closed.
+
+All three services burned CPU, memory, and threads for 45 seconds to produce a result nobody will ever see.
+
+## The three types of timeouts
+
+Every HTTP call has multiple phases where things can hang:
+
+### Connect timeout
+
+How long to wait for the TCP connection to be established. If the remote server is unreachable (wrong IP, firewall blocking, server down), this is where you find out.
+
+```
+Client → SYN → ............... (nothing) → timeout after 3s
+```
+
+**Typical value:** 1-5 seconds. If you can't establish a connection in 5 seconds, the server is unreachable — waiting longer won't help.
+
+### Read timeout (socket timeout)
+
+How long to wait for the server to send data after the connection is established. The server accepted the connection but is taking too long to respond — maybe it's running a slow query or waiting on its own dependencies.
+
+```
+Client → Connected → Request sent → ............... (silence) → timeout after 10s
+```
+
+**Typical value:** 5-30 seconds, depending on the expected operation time.
+
+### Total timeout (request timeout)
+
+The overall wall-clock time for the entire request, including connection, TLS handshake, sending the request, and reading the response. This is your safety net.
+
+```
+Connect (2s) + TLS (1s) + Send (0.5s) + Wait (10s) + Read (3s) = 16.5s
+Total timeout: 15s → TIMEOUT even though each phase was individually "fine"
+```
+
+**Typical value:** Should be less than or equal to the sum of your connect + read timeouts.
+
+<Callout type="warning" title="No timeout = infinite timeout">
+  <p>Most HTTP client libraries default to no timeout. That means a single hanging dependency can hold your thread forever. Always set explicit timeouts on every outbound call — never rely on defaults.</p>
+</Callout>
+
+### Setting all three
+
+```typescript
+// Node.js with fetch (AbortController for total timeout)
+const controller = new AbortController();
+const totalTimeout = setTimeout(() => controller.abort(), 15_000);
+
+const response = await fetch("https://api.geocoding.com/v1/lookup", {
+  signal: controller.signal,
+  // Connect and read timeouts depend on your HTTP library
+});
+clearTimeout(totalTimeout);
+```
+
+```bash
+# curl with explicit timeouts
+curl --connect-timeout 3 \
+     --max-time 15 \
+     https://api.geocoding.com/v1/lookup?address=Paris
+```
+
+## The deadline propagation problem
+
+Consider a three-service chain with independent timeouts:
+
+```
+User → Service A (timeout: 5s) → Service B (timeout: 5s) → Service C (timeout: 5s)
+```
+
+The user expects a response in ~5 seconds. But each service has its own 5-second timeout. In the worst case:
+
+```
+t=0s    Service A receives request, calls Service B
+t=4.9s  Service B finally responds to A, A calls Service C
+t=9.8s  Service C responds to B, B responds to A
+t=9.8s  Service A tries to respond — but the user gave up at t=5s
+```
+
+The request took ~10 seconds even though each individual call was within its own timeout. The problem: each service has no idea how much time the overall request has left.
+
+## Deadline propagation
+
+Instead of independent timeouts, propagate a **deadline** — an absolute timestamp by which the entire request must complete. Each service subtracts its own processing time and passes the remaining budget downstream.
+
+```
+User → Service A → Service B → Service C
+
+User sends request at t=0, expects response by t=5s
+Service A receives at t=0.0s, deadline = t+5s = 5.0s
+  Service A overhead: 0.1s
+  Passes to B: deadline = 4.9s remaining
+Service B receives at t=0.2s, deadline = 4.7s remaining
+  Service B overhead: 0.1s
+  Passes to C: deadline = 4.6s remaining
+Service C receives at t=0.3s, deadline = 4.4s remaining
+  Service C sets its timeout to 4.4s
+```
+
+Now every service knows the real constraint: how much time is left before the work is wasted.
+
+### The deadline header
+
+gRPC has built-in deadline propagation via the `grpc-timeout` header. For HTTP APIs, you can implement the same pattern with a custom header:
+
+```http
+POST /v1/geocode HTTP/1.1
+Host: service-c.internal
+Content-Type: application/json
+X-Request-Deadline: 2026-04-13T15:30:04.600Z
+X-Request-Timeout-Ms: 4400
+
+{
+  "address": "10 Downing Street, London"
+}
+```
+
+The receiving service checks the deadline before starting work:
+
+```typescript
+function handleRequest(req: Request): Response {
+  const deadlineHeader = req.headers["x-request-deadline"];
+  const deadline = deadlineHeader ? new Date(deadlineHeader) : null;
+
+  if (deadline && deadline <= new Date()) {
+    // Deadline already passed — don't bother processing
+    return new Response(JSON.stringify({
+      error: {
+        code: "deadline_exceeded",
+        message: "Request deadline has already passed"
+      }
+    }), { status: 504 });
+  }
+
+  const remainingMs = deadline
+    ? deadline.getTime() - Date.now()
+    : DEFAULT_TIMEOUT_MS;
+
+  // Use remaining time as the timeout for downstream calls
+  const result = await callDownstream(req.body, { timeoutMs: remainingMs - OVERHEAD_MS });
+
+  return new Response(JSON.stringify(result));
+}
+```
+
+<Callout type="aha" title="Why this matters">
+  <p>Without deadline propagation, Service C might start a 3-second database query when there's only 0.5 seconds left on the overall deadline. It will do all the work, produce a result, and send it back — but the user is already gone. Deadline propagation lets Service C know it should fail fast instead of wasting resources.</p>
+</Callout>
+
+## The cascading timeout failure
+
+Here's what a missing timeout looks like in a real system:
+
+```
+ Service A       Service B       Service C       External API
+     │               │               │               │
+     │──── req ─────►│               │               │
+     │               │──── req ─────►│               │
+     │               │               │──── req ─────►│
+     │               │               │               │ (hangs)
+     │  waiting...   │  waiting...   │  waiting...   │
+     │               │               │               │
+     │ thread held   │ thread held   │ thread held   │
+     │               │               │               │
+     │  30s later... │               │               │
+     │ ◄── timeout ──│               │               │
+     │               │ ◄── timeout ──│               │
+     │               │               │ ◄── timeout ──│
+```
+
+Each service's threads are blocked for the full duration. With 200 threads per service and a 30-second hang, you can exhaust your entire thread pool with just 7 requests per second (200 threads / 30 seconds).
+
+Compare with propagated deadlines:
+
+```
+ Service A       Service B       Service C       External API
+     │               │               │               │
+     │── req (5s) ──►│               │               │
+     │               │── req (4.8s) ►│               │
+     │               │               │── req (4.5s) ►│
+     │               │               │               │ (hangs)
+     │               │               │  4.5s timeout │
+     │               │               │◄── 504 ───────│
+     │               │ ◄── 504 ──────│               │
+     │ ◄── 504 ──────│               │               │
+     │                                                │
+     │  Total time: ~5s (not 30+s)                   │
+```
+
+## Timeout budget guidelines
+
+Here are practical starting points for common scenarios:
+
+| Call type | Connect timeout | Read timeout | Total timeout |
+|-----------|----------------|--------------|---------------|
+| Internal service (same region) | 1s | 5s | 5s |
+| Internal service (cross-region) | 3s | 10s | 12s |
+| External API (third-party) | 3s | 15s | 20s |
+| Database query | 1s | 5s | 5s |
+| Cache (Redis) | 0.5s | 1s | 1s |
+| User-facing API (edge to backend) | n/a | n/a | 10-30s |
+
+<Callout type="tip" title="Start tight, loosen if needed">
+  <p>It's better to start with aggressive timeouts and relax them based on observed p99 latency than to start with generous timeouts and never tighten them. A 5-second timeout that occasionally trips is a signal to fix the slow dependency, not to increase the timeout.</p>
+</Callout>
+
+## Handling timeout errors gracefully
+
+When a timeout occurs, give the client useful information:
+
+```http
+HTTP/1.1 504 Gateway Timeout
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "upstream_timeout",
+    "message": "The geocoding service did not respond in time",
+    "dependency": "geocoding-service",
+    "timeout_ms": 4400
+  }
+}
+```
+
+And critically: if the timed-out operation had side effects, you're now in an uncertain state. The downstream service might have processed the request but you didn't get the response. This is where idempotency (the first topic in this section) becomes essential — you need to be able to safely retry.
+
+## Checklist: timeout strategy
+
+- [ ] Set explicit connect, read, and total timeouts on every outbound call
+- [ ] Never rely on default timeouts from HTTP client libraries
+- [ ] Implement deadline propagation for service chains (custom header or gRPC built-in)
+- [ ] Check the deadline before starting expensive work
+- [ ] Set up alerts for timeout rates per dependency
+- [ ] Monitor p99 latency to inform timeout values
+- [ ] Pair timeouts with circuit breakers — if a dependency times out repeatedly, stop calling it
+
+---
+
+*Next up: API gateways — the single entry point that ties together rate limiting, circuit breaking, and routing across all your services.*

@@ -1,0 +1,238 @@
+---
+title: Retry Strategies & Exponential Backoff
+section: resilience
+difficulty: 2
+readMinutes: 5
+hook: Retrying without a strategy is just a DDoS on yourself
+takeaway: Use exponential backoff with jitter for retries, only retry on transient errors (429, 502, 503), and always respect the Retry-After header.
+---
+
+## In a nutshell
+
+When an API call fails, your first instinct is to try again. But retrying immediately and repeatedly can make things worse -- if a server is struggling, hundreds of clients hammering it at once will push it over the edge. Smart retry strategies wait longer between each attempt (exponential backoff) and add randomness (jitter) so all clients don't retry at the same moment.
+
+## The situation
+
+Your service calls a payment provider. It returns a `503 Service Unavailable`. Your code retries immediately. And again. And again — 3 retries in 200 milliseconds.
+
+Meanwhile, 500 other clients are doing the exact same thing. The payment provider, which was briefly overloaded, now faces 2,000 requests per second instead of 500. It collapses completely.
+
+Your retry logic just turned a transient blip into a full outage.
+
+## The naive retry problem
+
+Here's the retry code most people write first:
+
+```typescript
+// Don't do this
+async function callApi(url: string, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url);
+    if (response.ok) return response.json();
+    // Failed? Try again immediately
+  }
+  throw new Error("All retries failed");
+}
+```
+
+This has three fatal problems:
+
+1. **No delay** — retries hit the server instantly, amplifying load
+2. **Retries everything** — including `400 Bad Request` (which will fail forever)
+3. **Synchronized retries** — all clients retry at the same intervals, creating thundering herds
+
+## Which errors are worth retrying?
+
+Not every failure is transient. Some errors will fail the same way every time:
+
+| Status code | Retryable? | Why |
+|-------------|------------|-----|
+| 400 Bad Request | No | Your request is malformed — fix it |
+| 401 Unauthorized | No | Your credentials are wrong — retrying won't help |
+| 403 Forbidden | No | You lack permission — no amount of retrying changes that |
+| 404 Not Found | No | The resource doesn't exist |
+| 409 Conflict | Maybe | Could succeed if the conflicting state resolves |
+| 429 Too Many Requests | Yes | Rate limited — wait and try again |
+| 500 Internal Server Error | Maybe | Could be a transient bug or a permanent one |
+| 502 Bad Gateway | Yes | Upstream is temporarily unreachable |
+| 503 Service Unavailable | Yes | Server is overloaded — back off and retry |
+| 504 Gateway Timeout | Yes | Upstream timed out — might succeed next time |
+
+<Callout type="aha" title="The rule of thumb">
+  <p>Retry on 429 and 5xx (except 501). Never retry on 4xx (except 429). If you're not sure, don't retry — failing fast is better than hammering a dead server.</p>
+</Callout>
+
+## Exponential backoff
+
+Instead of retrying immediately, wait longer between each attempt:
+
+```
+Attempt 1: wait 1 second
+Attempt 2: wait 2 seconds
+Attempt 3: wait 4 seconds
+Attempt 4: wait 8 seconds
+Attempt 5: wait 16 seconds (or give up)
+```
+
+The formula is simple: `delay = baseDelay * 2^attempt`
+
+But there's still a problem. If 1,000 clients all start retrying at the same moment, they'll all retry at 1s, then 2s, then 4s — in perfect synchronization. The server gets hit by coordinated waves.
+
+## Adding jitter
+
+Jitter randomizes the delay so clients don't retry in lockstep:
+
+```
+Attempt 1: wait random(0, 1) seconds    → e.g., 0.7s
+Attempt 2: wait random(0, 2) seconds    → e.g., 1.3s
+Attempt 3: wait random(0, 4) seconds    → e.g., 2.9s
+Attempt 4: wait random(0, 8) seconds    → e.g., 5.1s
+```
+
+This is called **full jitter** and it's the most effective approach. AWS's analysis showed it significantly outperforms both no-jitter and equal-jitter strategies in reducing total load.
+
+Here's a proper retry implementation:
+
+```typescript
+async function callWithRetry(
+  url: string,
+  options: RequestInit = {},
+  maxRetries = 4,
+  baseDelayMs = 1000
+): Promise<Response> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url, options);
+
+    if (response.ok) return response;
+
+    // Don't retry client errors (except 429)
+    if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+      throw new Error(`Client error: ${response.status}`);
+    }
+
+    if (attempt === maxRetries) {
+      throw new Error(`Failed after ${maxRetries + 1} attempts: ${response.status}`);
+    }
+
+    // Respect Retry-After header if present
+    const retryAfter = response.headers.get("Retry-After");
+    let delayMs: number;
+
+    if (retryAfter) {
+      const parsed = parseInt(retryAfter, 10);
+      delayMs = isNaN(parsed)
+        ? new Date(retryAfter).getTime() - Date.now()
+        : parsed * 1000;
+    } else {
+      // Exponential backoff with full jitter
+      const maxDelay = baseDelayMs * Math.pow(2, attempt);
+      delayMs = Math.random() * maxDelay;
+    }
+
+    await sleep(delayMs);
+  }
+
+  throw new Error("Unreachable");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+```
+
+## The Retry-After header
+
+Well-behaved APIs tell you exactly how long to wait when you're rate-limited or when the service is unavailable:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 30
+
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "Rate limit exceeded. Try again in 30 seconds.",
+    "retry_after": 30
+  }
+}
+```
+
+The `Retry-After` header can be either seconds or an HTTP date:
+
+```http
+Retry-After: 120
+Retry-After: Sun, 13 Apr 2026 15:30:00 GMT
+```
+
+<Callout type="tip" title="Always check Retry-After first">
+  <p>If the server tells you when to retry, use that value instead of your backoff calculation. The server knows its own capacity better than your exponential formula does.</p>
+</Callout>
+
+## Timing comparison
+
+Here's what the different strategies look like in practice for 100 clients hitting a temporarily-down service:
+
+```
+Naive retry (no delay):
+  t=0.0s  ████████████████████████ 100 requests
+  t=0.1s  ████████████████████████ 100 requests
+  t=0.2s  ████████████████████████ 100 requests
+  Total load in first 1s: ~1000 requests
+
+Exponential backoff (no jitter):
+  t=0s    ████████████████████████ 100 requests
+  t=1s    ████████████████████████ 100 requests (synchronized wave)
+  t=2s    ████████████████████████ 100 requests (synchronized wave)
+  Total load in first 4s: ~400 requests
+
+Exponential backoff + jitter:
+  t=0s    ████████████████████████ 100 requests
+  t=1s    ████████                 35 requests (spread out)
+  t=2s    ██████                   25 requests (spread out)
+  t=3s    ████                     20 requests (spread out)
+  Total load in first 4s: ~250 requests (evenly distributed)
+```
+
+The third approach gives the struggling server breathing room to recover.
+
+## Retry budgets
+
+Individual retry limits (per request) aren't enough. You also need a **system-level retry budget** — a cap on what percentage of your traffic is retries.
+
+A common rule: retries should not exceed 10% of total traffic. If your service sends 1,000 requests per second and 100 of them are retries, that's fine. If 500 of them are retries, your retry logic is the problem.
+
+```typescript
+class RetryBudget {
+  private totalRequests = 0;
+  private retryCount = 0;
+  private readonly maxRetryRatio = 0.1;
+
+  canRetry(): boolean {
+    return this.retryCount / Math.max(this.totalRequests, 1) < this.maxRetryRatio;
+  }
+
+  recordRequest() { this.totalRequests++; }
+  recordRetry() { this.retryCount++; }
+
+  // Reset counters periodically (e.g., every 10 seconds)
+}
+```
+
+<Callout type="warning" title="Retries multiply">
+  <p>If Service A retries 3 times on Service B, and Service B retries 3 times on Service C, a single user request can generate up to 9 calls to Service C. In deep call chains, set lower retry limits or only retry at the edge.</p>
+</Callout>
+
+## Checklist: retry strategy
+
+- [ ] Only retry on transient errors (429, 502, 503, 504)
+- [ ] Use exponential backoff with full jitter
+- [ ] Respect `Retry-After` headers when present
+- [ ] Set a maximum retry count (3-5 is typical)
+- [ ] Cap the maximum delay (don't wait 5 minutes between retries)
+- [ ] Implement a retry budget to prevent retry storms
+- [ ] Ensure all retried operations are idempotent
+
+---
+
+*Next up: circuit breakers — because sometimes the right retry strategy is to stop retrying entirely.*

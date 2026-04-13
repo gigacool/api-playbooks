@@ -1,0 +1,236 @@
+---
+title: CORS
+section: security
+difficulty: 1
+readMinutes: 5
+hook: Every frontend dev has fought it, few understand it
+takeaway: CORS is the browser enforcing that your API explicitly opts in to cross-origin requests — it's not a server security mechanism, it's a client protection, and misconfiguring it is worse than not having it.
+---
+
+## In a nutshell
+
+When your frontend at `app.example.com` tries to call your API at `api.example.com`, the browser blocks it by default -- that's the Same-Origin Policy. CORS is the mechanism your API uses to explicitly say "yes, I allow requests from this origin." Without it, your API works fine in Postman but breaks in the browser.
+
+## The situation
+
+You deploy your React app on `app.example.com` and your API on `api.example.com`. The first API call from the browser fails with: "Access to fetch at 'https://api.example.com' from origin 'https://app.example.com' has been blocked by CORS policy." Someone Googles it and adds `Access-Control-Allow-Origin: *` to the server. The error disappears. The security hole opens.
+
+## What CORS actually is
+
+CORS (Cross-Origin Resource Sharing) is a **browser-enforced** mechanism. It exists because browsers follow the Same-Origin Policy: JavaScript on `app.example.com` cannot make requests to `api.example.com` unless the API explicitly allows it.
+
+Key point: **CORS does not protect your API.** It protects **users' browsers** from malicious sites making requests to your API using the user's cookies. `curl`, Postman, and server-to-server calls are completely unaffected by CORS — they don't have a browser enforcing it.
+
+<Callout type="aha" title="The mental model">
+  <p>CORS is the API saying "I consent to being called from this origin." Without that consent, the browser refuses to show the response to JavaScript. The request might still reach your server — the browser just won't let the calling code see the response.</p>
+</Callout>
+
+## The preflight flow
+
+When a browser makes a "non-simple" cross-origin request (anything with custom headers, JSON content type, or methods other than GET/POST/HEAD), it sends a **preflight** request first. Here's the flow at a glance:
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant API Server
+    Browser->>API Server: OPTIONS /api/users (preflight)
+    Note right of Browser: Origin, Access-Control-Request-Method, Access-Control-Request-Headers
+    API Server-->>Browser: 204 No Content + CORS headers
+    Note left of API Server: Allow-Origin, Allow-Methods, Allow-Headers, Max-Age
+    Browser->>Browser: Check CORS headers, origin allowed?
+    Browser->>API Server: POST /api/users (actual request)
+    Note right of Browser: Origin, Authorization, Content-Type: application/json
+    API Server-->>Browser: 201 Created + CORS headers + response body
+    Browser->>Browser: CORS headers present, expose to JS
+```
+
+### Step 1: Browser sends OPTIONS preflight
+
+```http
+OPTIONS /api/users HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: Content-Type, Authorization
+```
+
+The browser is asking: "Will you accept a POST request from `app.example.com` with these headers?"
+
+### Step 2: Server responds with CORS headers
+
+```http
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Max-Age: 86400
+Access-Control-Allow-Credentials: true
+```
+
+The server says: "Yes, I accept requests from that origin, with those methods and headers. Cache this response for 24 hours so you don't have to ask again."
+
+### Step 3: Browser sends the actual request
+
+```http
+POST /api/users HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+
+{
+  "name": "Alice Johnson",
+  "email": "alice@example.com"
+}
+```
+
+### Step 4: Server responds with CORS headers on the actual response
+
+```http
+HTTP/1.1 201 Created
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+Content-Type: application/json
+
+{
+  "id": "usr_8a3f",
+  "name": "Alice Johnson",
+  "email": "alice@example.com"
+}
+```
+
+## Testing with curl
+
+You can simulate the preflight and actual request yourself:
+
+```bash
+# Simulate the preflight
+curl -X OPTIONS https://api.example.com/api/users \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: Content-Type, Authorization" \
+  -v 2>&1 | grep -i "access-control"
+```
+
+```text
+< Access-Control-Allow-Origin: https://app.example.com
+< Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+< Access-Control-Allow-Headers: Content-Type, Authorization
+< Access-Control-Allow-Credentials: true
+< Access-Control-Max-Age: 86400
+```
+
+```bash
+# Simulate the actual request
+curl -X POST https://api.example.com/api/users \
+  -H "Origin: https://app.example.com" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIs..." \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+```
+
+## The CORS headers explained
+
+| Header | Purpose | Example |
+|---|---|---|
+| `Access-Control-Allow-Origin` | Which origins can access the API | `https://app.example.com` |
+| `Access-Control-Allow-Methods` | Which HTTP methods are allowed | `GET, POST, PUT, DELETE` |
+| `Access-Control-Allow-Headers` | Which request headers are allowed | `Content-Type, Authorization` |
+| `Access-Control-Allow-Credentials` | Whether cookies/auth headers are sent | `true` |
+| `Access-Control-Max-Age` | How long to cache the preflight (seconds) | `86400` |
+| `Access-Control-Expose-Headers` | Which response headers JS can read | `X-Request-Id, X-RateLimit-Remaining` |
+
+## The danger of `Access-Control-Allow-Origin: *`
+
+The wildcard allows **any** website to make requests to your API. If a malicious site includes JavaScript that calls your API, the browser will allow it.
+
+```http
+# Overly permissive — any site can call your API
+Access-Control-Allow-Origin: *
+```
+
+This is fine for truly public APIs with no authentication (weather data, public datasets). It's dangerous for anything that uses cookies or session tokens, because `*` cannot be combined with `Access-Control-Allow-Credentials: true` — but developers work around this by dynamically reflecting the Origin header, which is even worse.
+
+### The reflection anti-pattern
+
+```python
+# NEVER DO THIS — reflects any origin, including attacker-controlled ones
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get("Origin")
+    response.headers["Access-Control-Allow-Origin"] = origin  # reflects anything
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+```
+
+This is equivalent to `*` but bypasses the browser's safety check that prevents `*` + credentials. An attacker's site at `evil.com` sends a request with the user's cookies, and your server happily responds with `Access-Control-Allow-Origin: https://evil.com`.
+
+<Callout type="warning" title="Origin reflection = no CORS at all">
+  <p>Reflecting the request's Origin header back as the allowed origin defeats the entire purpose of CORS. An attacker hosts a page that makes requests to your API, and the user's browser will happily send cookies and show the response. Always validate the Origin against an explicit allowlist.</p>
+</Callout>
+
+## Properly configured CORS
+
+```python
+ALLOWED_ORIGINS = {
+    "https://app.example.com",
+    "https://staging.example.com",
+    "http://localhost:3000",  # development only
+}
+
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+```
+
+Compare the responses:
+
+```http
+# Request from allowed origin
+Origin: https://app.example.com
+# Response:
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+```
+
+```http
+# Request from unknown origin
+Origin: https://evil.com
+# Response:
+# (no CORS headers — browser blocks the response)
+```
+
+<Callout type="tip" title="Avoid localhost in production">
+  <p>Keep <code>http://localhost:3000</code> in your allowlist only in development. Use environment variables to control which origins are allowed per environment. Production should list only production domains.</p>
+</Callout>
+
+## Simple vs preflighted requests
+
+Not every cross-origin request triggers a preflight. **Simple requests** skip the OPTIONS step:
+
+| Simple (no preflight) | Non-simple (preflight required) |
+|---|---|
+| Methods: GET, HEAD, POST | Methods: PUT, DELETE, PATCH |
+| Headers: Accept, Content-Language, Content-Type | Custom headers: Authorization, X-Request-Id |
+| Content-Type: text/plain, multipart/form-data, application/x-www-form-urlencoded | Content-Type: application/json |
+
+Since most APIs use `Authorization` headers and `application/json`, almost every request triggers a preflight. The `Access-Control-Max-Age` header reduces the overhead by caching the preflight result.
+
+## Checklist: CORS configuration
+
+- [ ] Am I using an explicit origin allowlist, not `*` or origin reflection?
+- [ ] Is `Access-Control-Allow-Credentials` only set when I need cookies/auth headers?
+- [ ] Is `Access-Control-Max-Age` set to avoid repeated preflights?
+- [ ] Are `localhost` origins excluded in production?
+- [ ] Am I only exposing the response headers that clients actually need?
+
+---
+
+*Next up: secrets management — because API keys in URLs end up in logs, always.*

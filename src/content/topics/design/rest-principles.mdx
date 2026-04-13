@@ -1,0 +1,242 @@
+---
+title: REST Design Principles
+section: design
+difficulty: 1
+readMinutes: 6
+hook: "Resources and state transfers, not database table wrappers"
+takeaway: REST is about manipulating resources through representations — use HTTP methods as intended, understand the difference between PUT and PATCH, and don't overthink the "RESTful" label.
+---
+
+## In a nutshell
+
+REST is the architectural style behind most web APIs. The core idea is simple: everything is a resource (like a user or an order) with its own URL, and you use standard HTTP methods -- GET to read, POST to create, PUT to replace, PATCH to update, DELETE to remove. Each request is self-contained, meaning the server doesn't remember anything between calls. Understanding these fundamentals helps you build APIs that work naturally with the entire HTTP ecosystem.
+
+## The situation
+
+A new engineer joins your team and asks why `GET /users` returns a list but `GET /users/123/activate` changes state. Someone else asks why the API uses `POST` for everything. A third person brings up HATEOAS in a code review and nobody knows whether to take it seriously.
+
+REST is the most used and least understood architectural style in software. Most "REST APIs" are really "JSON over HTTP" — which is fine, as long as you understand what you're actually building.
+
+## REST in 60 seconds
+
+REST (Representational State Transfer) is an architectural style with a core idea: **clients interact with resources by exchanging representations of their state**.
+
+In practice, that means:
+
+1. **Everything is a resource** — identified by a URI (`/orders/456`)
+2. **Interactions use standard HTTP methods** — GET, POST, PUT, PATCH, DELETE
+3. **Representations carry the state** — typically JSON bodies
+4. **The server is stateless** — each request contains everything needed to process it
+
+That's it. Is it "REST" or "RESTful"? Honestly, this debate isn't worth your time. If you're using resources, standard HTTP methods, and JSON representations, you're close enough. Spend your energy on good API design, not on theological compliance with Roy Fielding's thesis.
+
+## HTTP methods: what each one means
+
+### GET — Read a resource
+
+```bash
+GET /api/orders/456
+```
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "id": "order_456",
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 2, "unitPrice": 29.99 }
+  ],
+  "total": 59.98,
+  "status": "confirmed",
+  "createdAt": "2026-04-10T14:22:00Z"
+}
+```
+
+GET is **safe** (no side effects) and **idempotent** (calling it 10 times produces the same result). Never use GET to modify state.
+
+### POST — Create a resource
+
+```bash
+POST /api/orders
+Content-Type: application/json
+
+{
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 2 }
+  ]
+}
+```
+
+```json
+HTTP/1.1 201 Created
+Location: /api/orders/order_789
+
+{
+  "id": "order_789",
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 2, "unitPrice": 29.99 }
+  ],
+  "total": 59.98,
+  "status": "pending",
+  "createdAt": "2026-04-13T09:15:00Z"
+}
+```
+
+POST is **not idempotent** — sending the same request twice creates two orders. Return `201 Created` with the full resource and a `Location` header.
+
+### DELETE — Remove a resource
+
+```bash
+DELETE /api/orders/order_789
+```
+
+```json
+HTTP/1.1 204 No Content
+```
+
+DELETE is **idempotent** — deleting the same resource twice should not fail. The first call deletes it, the second returns `204` (or `404`, both are acceptable patterns).
+
+## PUT vs PATCH: the difference that matters
+
+This is the most commonly misunderstood part of REST. Both update a resource, but they do it differently.
+
+### PUT — Full replacement
+
+PUT replaces the **entire resource** with the provided representation. If you omit a field, it gets removed (or reset to its default).
+
+```bash
+PUT /api/orders/order_456
+Content-Type: application/json
+
+{
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 3 },
+    { "productId": "prod_B", "quantity": 1 }
+  ],
+  "status": "confirmed"
+}
+```
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "id": "order_456",
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 3, "unitPrice": 29.99 },
+    { "productId": "prod_B", "quantity": 1, "unitPrice": 14.99 }
+  ],
+  "total": 104.96,
+  "status": "confirmed",
+  "createdAt": "2026-04-10T14:22:00Z"
+}
+```
+
+PUT is **idempotent** — sending the same PUT request 5 times produces the same result.
+
+### PATCH — Partial update
+
+PATCH updates **only the fields you send**. Everything else stays unchanged.
+
+```bash
+PATCH /api/orders/order_456
+Content-Type: application/json
+
+{
+  "status": "shipped"
+}
+```
+
+```json
+HTTP/1.1 200 OK
+
+{
+  "id": "order_456",
+  "customer": "cust_123",
+  "items": [
+    { "productId": "prod_A", "quantity": 3, "unitPrice": 29.99 },
+    { "productId": "prod_B", "quantity": 1, "unitPrice": 14.99 }
+  ],
+  "total": 104.96,
+  "status": "shipped",
+  "createdAt": "2026-04-10T14:22:00Z"
+}
+```
+
+Only `status` changed. The items, customer, and total remain untouched.
+
+<Callout type="aha" title="The practical choice">
+  <p>Most real-world APIs use PATCH for updates because clients rarely want to send the entire resource back. PUT is useful when you genuinely want to replace the whole thing — like overwriting a configuration file or replacing a document. When in doubt, support PATCH.</p>
+</Callout>
+
+### Side-by-side comparison
+
+| Aspect | PUT | PATCH |
+|---|---|---|
+| Semantics | Full replacement | Partial update |
+| Missing fields | Reset to default or removed | Left unchanged |
+| Idempotent | Yes | Technically no (depends on implementation) |
+| Request body | Complete resource representation | Only changed fields |
+| Common use case | Replace a config, overwrite a doc | Update a user's email, change an order status |
+
+## What stateless really means
+
+Every request must contain **all the information** the server needs to process it. The server doesn't store client session state between requests.
+
+```bash
+# Stateful (server remembers who you are from a previous call)
+GET /api/my-orders
+# Server: "Who is 'my'? Oh right, I have a session for you."
+
+# Stateless (every request identifies itself)
+GET /api/orders?customer=cust_123
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+# Server: "You're cust_123, authenticated by this token. Here are your orders."
+```
+
+Statelessness is what makes REST APIs horizontally scalable. Any server in the cluster can handle any request — no sticky sessions, no shared memory.
+
+<Callout type="warning" title="Sessions are not stateless">
+  <p>If your API requires a prior call to "initialize" something before subsequent calls work, you've introduced hidden state. Each request should stand on its own.</p>
+</Callout>
+
+## Content negotiation
+
+The `Content-Type` header declares what format the request body is in. The `Accept` header declares what format the client wants in the response.
+
+```bash
+POST /api/orders
+Content-Type: application/json
+Accept: application/json
+
+{ "customer": "cust_123" }
+```
+
+In practice, nearly everything is JSON. But the mechanism exists for APIs that support XML, Protocol Buffers, or other formats. It becomes more relevant when you get into API versioning via content negotiation (covered in the schema evolution topic).
+
+## Quick method reference
+
+| Method | Purpose | Idempotent | Safe | Request body |
+|---|---|---|---|---|
+| GET | Read | Yes | Yes | No |
+| POST | Create | No | No | Yes |
+| PUT | Full replace | Yes | No | Yes |
+| PATCH | Partial update | No* | No | Yes |
+| DELETE | Remove | Yes | No | Rarely |
+| HEAD | Read headers only | Yes | Yes | No |
+| OPTIONS | Discover capabilities | Yes | Yes | No |
+
+*PATCH can be implemented as idempotent, but the spec doesn't guarantee it.
+
+<Callout type="tip" title="Method safety matters for caching">
+  <p>Browsers and CDNs cache GET and HEAD responses automatically. They never cache POST, PUT, PATCH, or DELETE. Using methods correctly means free caching behavior.</p>
+</Callout>
+
+---
+
+*Next up: query design — filtering, sorting, pagination, and sparse fieldsets for when a simple GET isn't enough.*

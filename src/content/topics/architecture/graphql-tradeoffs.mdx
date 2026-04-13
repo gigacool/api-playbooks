@@ -1,0 +1,269 @@
+---
+title: "GraphQL: When It Shines, When It Doesn't"
+section: architecture
+difficulty: 2
+readMinutes: 6
+hook: It solves real problems and introduces new ones
+takeaway: GraphQL eliminates over-fetching and under-fetching by letting clients ask for exactly what they need — but it shifts complexity to the server and introduces new challenges around performance, security, and caching.
+---
+
+## In a nutshell
+
+GraphQL lets the client decide exactly which data to request in a single query, instead of the server deciding what to return from a fixed endpoint. This is powerful when different clients need different data from the same resources -- but it comes with real costs: harder caching, new performance pitfalls, and security challenges that don't exist in REST. It solves specific problems well and creates new ones, so the decision to use it should be deliberate.
+
+## The situation
+
+Your mobile app shows a user's profile page: their name, avatar, three recent orders (just the title and status), and a count of unread notifications. With your REST API, that's three requests:
+
+```bash
+# Request 1: Get user profile (returns 22 fields, you need 2)
+GET /api/users/usr_8a3f
+
+# Request 2: Get recent orders (returns full order objects, you need title + status)
+GET /api/users/usr_8a3f/orders?limit=3
+
+# Request 3: Get notification count
+GET /api/users/usr_8a3f/notifications/count
+```
+
+Three round trips. Two of them return far more data than you need. On a cellular connection with 150ms round-trip latency, that's 450ms of network overhead before your app can render anything meaningful.
+
+## The same data with GraphQL
+
+One request. You ask for exactly what you need:
+
+```graphql
+query ProfilePage($userId: ID!) {
+  user(id: $userId) {
+    name
+    avatarUrl
+    orders(first: 3, orderBy: CREATED_AT_DESC) {
+      title
+      status
+    }
+    notificationCount
+  }
+}
+```
+
+Variables:
+
+```json
+{
+  "userId": "usr_8a3f"
+}
+```
+
+Response:
+
+```json
+{
+  "data": {
+    "user": {
+      "name": "Alice Chen",
+      "avatarUrl": "https://cdn.example.com/avatars/usr_8a3f.jpg",
+      "orders": [
+        { "title": "Wireless Keyboard Pro", "status": "shipped" },
+        { "title": "USB-C Hub 7-in-1", "status": "delivered" },
+        { "title": "Desk Lamp LED", "status": "delivered" }
+      ],
+      "notificationCount": 7
+    }
+  }
+}
+```
+
+One round trip. No over-fetching. The response matches the query shape exactly. The mobile client gets precisely the bytes it needs and nothing more.
+
+<Callout type="aha" title="The real value">
+  <p>GraphQL doesn't just save bandwidth. It shifts the data contract from "here's what the server decided to return" to "here's what the client asked for." This is powerful when you have multiple clients with different data needs — the same schema serves all of them without building separate endpoints.</p>
+</Callout>
+
+## Where GraphQL shines
+
+### Deeply nested, relational data
+
+When your UI needs to traverse relationships — a user's teams, each team's projects, each project's recent deployments — REST forces you to either over-fetch (include everything) or make N+1 requests. GraphQL handles this naturally:
+
+```graphql
+query Dashboard {
+  me {
+    teams {
+      name
+      projects(status: ACTIVE) {
+        name
+        lastDeployment {
+          status
+          timestamp
+        }
+      }
+    }
+  }
+}
+```
+
+### Rapid frontend iteration
+
+When the frontend team wants to add a field to a page, they change the query. No backend deployment needed. No new endpoint. No API version bump. The schema already exposes the field — the client just wasn't asking for it yet.
+
+### Multiple client types
+
+Mobile, web, TV, watch — each with different screen sizes, bandwidth constraints, and data needs. One GraphQL schema serves all of them. Each client requests exactly what it can display.
+
+## Where GraphQL hurts
+
+### The N+1 problem at the resolver level
+
+Every field in a GraphQL schema is backed by a resolver function. When you query a list of users and their orders, the naive implementation does this:
+
+```text
+1. Query: SELECT * FROM users WHERE team_id = 'team_1'  → 25 users
+2. For each user: SELECT * FROM orders WHERE user_id = ?  → 25 queries
+```
+
+That's 26 database queries for one GraphQL request. With REST, you'd write a single endpoint that joins the tables. With GraphQL, you need a **dataloader** to batch and deduplicate:
+
+```typescript
+// Without dataloader: 25 individual queries
+const orderResolver = async (user) => {
+  return db.orders.findByUserId(user.id); // Called 25 times
+};
+
+// With dataloader: 1 batched query
+const orderLoader = new DataLoader(async (userIds) => {
+  const orders = await db.orders.findByUserIds(userIds);
+  return userIds.map((id) => orders.filter((o) => o.userId === id));
+});
+
+const orderResolver = async (user) => {
+  return orderLoader.load(user.id); // Batched into one query
+};
+```
+
+Dataloaders are essential but not automatic. Every relationship in your schema needs one. Miss one, and you have a hidden performance bomb.
+
+### Query cost analysis
+
+REST endpoints have predictable cost. `GET /api/users` always does roughly the same work. GraphQL queries have variable cost — a client can ask for anything the schema allows:
+
+```graphql
+# This innocent-looking query could be catastrophic
+query {
+  users(first: 100) {
+    orders(first: 50) {
+      items(first: 20) {
+        product {
+          reviews(first: 100) {
+            author {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+That's potentially `100 * 50 * 20 * 100 = 10,000,000` resolved objects. You need **query cost analysis** to prevent this:
+
+```json
+{
+  "query_cost": {
+    "max_cost": 1000,
+    "max_depth": 5,
+    "cost_rules": {
+      "default_field_cost": 1,
+      "list_multiplier": "first_argument",
+      "expensive_fields": {
+        "reviews": 5,
+        "analytics": 10
+      }
+    }
+  }
+}
+```
+
+When a query exceeds the cost budget, reject it before execution:
+
+```json
+{
+  "errors": [
+    {
+      "message": "Query cost 12500 exceeds maximum allowed cost of 1000",
+      "extensions": {
+        "code": "QUERY_TOO_EXPENSIVE",
+        "cost": 12500,
+        "max_cost": 1000
+      }
+    }
+  ]
+}
+```
+
+### Authorization complexity
+
+In REST, you authorize at the endpoint level: "Can this user access `GET /api/admin/reports`?" In GraphQL, there's one endpoint. Authorization must happen at the **field level**:
+
+```typescript
+const resolvers = {
+  User: {
+    email: (user, args, context) => {
+      // Only the user themselves or admins can see email
+      if (context.userId !== user.id && !context.isAdmin) {
+        return null;
+      }
+      return user.email;
+    },
+    salary: (user, args, context) => {
+      // Only HR and the user's direct manager
+      if (!context.roles.includes("hr") && context.userId !== user.managerId) {
+        throw new ForbiddenError("Not authorized to view salary");
+      }
+      return user.salary;
+    },
+  },
+};
+```
+
+Every sensitive field needs its own authorization check. Miss one, and you've leaked data. This is fundamentally harder to audit than REST's route-level middleware.
+
+<Callout type="warning" title="Caching is harder">
+  <p>REST APIs get HTTP caching nearly for free — <code>GET /api/users/usr_8a3f</code> is a cacheable URL. GraphQL sends everything as <code>POST /graphql</code> with a request body. HTTP caches can't help you. You need application-level caching, persisted queries, or a CDN that understands GraphQL (like Apollo's edge caching).</p>
+</Callout>
+
+## REST vs GraphQL decision framework
+
+| Factor | Lean REST | Lean GraphQL |
+|---|---|---|
+| **Number of client types** | 1-2 with similar needs | 3+ with different data needs |
+| **Data relationships** | Flat, resource-oriented | Deeply nested, graph-like |
+| **Frontend iteration speed** | Backend and frontend deploy together | Frontend iterates independently |
+| **Caching requirements** | HTTP caching is critical (CDN, browser) | Application-level caching is acceptable |
+| **Team size** | Small team owns both sides | Separate frontend/backend teams |
+| **API consumers** | External developers, partners | Internal clients you control |
+| **Payload optimization** | Not critical (broadband) | Critical (mobile, constrained networks) |
+| **Existing infrastructure** | REST middleware, monitoring, tooling in place | Starting fresh or willing to invest in GraphQL tooling |
+
+### The honest answer
+
+Most teams should default to REST. It's simpler to build, cache, monitor, secure, and explain. GraphQL earns its complexity when you have multiple clients with genuinely different data needs, deeply relational data, and a team willing to invest in dataloaders, query cost analysis, and field-level authorization.
+
+If you're building a single web app with a single backend team, GraphQL adds complexity without proportional benefit. If you're building a platform with mobile, web, and TV clients — each maintained by different teams pulling different shapes of data from a rich domain model — GraphQL can be transformative.
+
+<Callout type="tip" title="You don't have to pick one">
+  <p>Many production systems use both. REST for simple CRUD and external APIs (easy to cache, easy to document). GraphQL for complex internal UIs that need flexible data fetching. They coexist just fine behind an API gateway.</p>
+</Callout>
+
+## Checklist: evaluating GraphQL for your system
+
+- [ ] Do you have multiple clients with genuinely different data needs?
+- [ ] Is over-fetching or under-fetching causing measurable performance issues?
+- [ ] Is your team prepared to implement dataloaders for every relationship?
+- [ ] Do you have a plan for query cost limiting and depth limiting?
+- [ ] Can you handle field-level authorization for sensitive data?
+- [ ] Are you okay with application-level caching instead of HTTP caching?
+
+---
+
+*Next up: the Saga Pattern — how to coordinate multi-step transactions across services when you can't use a database transaction.*

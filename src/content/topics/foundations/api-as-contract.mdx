@@ -1,0 +1,94 @@
+---
+title: The API Contract Mental Model
+section: foundations
+difficulty: 1
+readMinutes: 4
+hook: Every design decision is a promise you'll have to keep
+takeaway: Think of your API as a contract between producer and consumer — every endpoint, field, and status code is a commitment.
+---
+
+## In a nutshell
+
+Every endpoint, field, and status code in your API is a promise to everyone who uses it. Once someone builds against your API, changing it can break their app. Thinking of your API as a contract -- not just code -- changes how you make every design decision.
+
+## The situation
+
+Your team ships a new endpoint. A mobile client starts using it. Two sprints later, someone renames a field from `userName` to `user_name` for consistency. The mobile app crashes in production.
+
+This isn't a bug. It's a broken promise.
+
+## What is an API contract?
+
+An API isn't just code that receives requests and returns responses. It's an **agreement** between the producer (the team building the API) and the consumer (the team or system calling it). Every part of that agreement carries weight:
+
+- **Endpoints** — the addresses you expose become permanent addresses
+- **Request shapes** — the fields you accept become expected inputs
+- **Response shapes** — the fields you return become dependencies
+- **Status codes** — the errors you send become handled cases
+- **Behavior** — the side effects you trigger become relied-upon guarantees
+
+Once a consumer depends on any of these, changing them has a cost. The cost might be a broken app, a failed integration, or a 3am incident.
+
+<Callout type="aha" title="The core insight">
+  <p>An API is not an implementation detail. It's a published interface with downstream dependencies. Every field you add is a field you'll have to support. Every behavior you ship is a behavior someone will rely on.</p>
+</Callout>
+
+## Why this matters more than you think
+
+Most engineers think about APIs as **technical plumbing** — a way to get data from A to B. But the contract mental model changes how you approach every design decision:
+
+| Without the contract lens | With the contract lens |
+|---|---|
+| "Let's add this field, we might need it" | "Do we want to commit to supporting this field?" |
+| "Let's rename this for consistency" | "This is a breaking change — how do we migrate?" |
+| "Let's return the full object" | "What's the minimal response that fulfills the contract?" |
+| "We'll fix the error format later" | "Consumers are already parsing this format" |
+
+### The Hyrum's Law problem
+
+> "With a sufficient number of users of an API, all observable behaviors of your system will be depended on by somebody."
+
+This isn't theoretical. If your API returns results in a specific order (even accidentally), someone will depend on that order. If your error messages contain a specific string, someone will parse it. If your endpoint responds in under 100ms, someone will set their timeout to 150ms.
+
+**Everything observable becomes part of the contract** — whether you intended it or not.
+
+## Implicit vs explicit contracts
+
+The best teams make their contracts **explicit** by using specifications:
+
+- **OpenAPI** (for REST APIs) — describes endpoints, schemas, and behaviors in a machine-readable format
+- **AsyncAPI** (for event-driven APIs) — does the same for message-based systems
+- **Protocol Buffers** (for gRPC) — defines the contract as a `.proto` file
+- **GraphQL Schema** — the schema IS the contract
+
+When you don't have an explicit contract, you have an **implicit** one — defined by whatever your code happens to do today. Implicit contracts are dangerous because nobody knows what they're promising until they break it.
+
+<Callout type="tip" title="Start here">
+  <p>If you take one thing from this playbook: write your API contract before you write your API code. Even a simple OpenAPI spec forces you to think about what you're committing to before you commit to it.</p>
+</Callout>
+
+## The cost of a broken contract
+
+Breaking an API contract isn't like breaking internal code. Internal code has a compiler and test suite to catch breakage. API contracts break **across boundaries** — between teams, between services, between organizations.
+
+The downstream cost of a breaking change:
+
+- **Internal APIs** — broken services, cascading failures, rollback pressure
+- **Partner APIs** — broken integrations, support tickets, trust erosion
+- **Public APIs** — broken apps, angry developers, version fragmentation
+
+The earlier you internalize the contract mental model, the fewer breaking changes you'll ship. And the fewer breaking changes you ship, the less time you'll spend managing migrations, supporting old versions, and apologizing to consumers.
+
+## Checklist: applying the contract lens
+
+Before shipping any API change, ask:
+
+- [ ] Is this a new commitment or a change to an existing one?
+- [ ] Could any consumer break if I deploy this?
+- [ ] Have I documented what I'm promising?
+- [ ] Am I returning more data than necessary?
+- [ ] Could I make this change additive instead of breaking?
+
+---
+
+*Next up: synchronous vs asynchronous communication — the most fundamental architecture decision for your API.*

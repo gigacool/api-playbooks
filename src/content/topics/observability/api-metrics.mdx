@@ -1,0 +1,218 @@
+---
+title: API Metrics That Matter
+section: observability
+difficulty: 2
+readMinutes: 5
+hook: p50/p95/p99 — because averages are lies
+takeaway: Percentile-based latency metrics, error rates, traffic volume, and saturation are the four signals that tell you what's actually happening in production.
+---
+
+## In a nutshell
+
+Averages lie. If 99 requests take 50ms and one takes 5 seconds, the average says "everything's fine" while one in a hundred users has a terrible experience. API metrics that actually matter use percentiles (p50, p95, p99) to show what your fastest, typical, and slowest users experience. Combined with error rates, traffic volume, and resource saturation, these four signals tell you whether your API is healthy or heading toward trouble.
+
+## The situation
+
+Your API dashboard shows average response time: 99ms. The CEO is happy. The SRE is happy. Everyone goes home.
+
+Meanwhile, 1% of your users are waiting 5 seconds for every request. They're not happy. They're churning. And your average metric is hiding them.
+
+Here's the math. You have 100 requests:
+
+- 99 requests complete in 50ms
+- 1 request completes in 5000ms
+- **Average: 99.5ms** — looks great
+- **p99: 5000ms** — one in a hundred users waits 5 seconds
+
+The average is technically correct. It's also completely useless for understanding user experience.
+
+## Percentiles: what to actually measure
+
+Percentiles tell you what percentage of requests are faster than a given value. They expose the tail — the worst experiences your users actually have.
+
+| Percentile | Meaning | What it tells you |
+|---|---|---|
+| **p50** (median) | Half of requests are faster | Your typical user experience |
+| **p95** | 95% of requests are faster | Your slow-but-not-rare experience |
+| **p99** | 99% of requests are faster | Your tail latency — the 1% that hurts |
+| **p99.9** | 99.9% of requests are faster | Your worst-case users (often power users or bots) |
+
+A healthy API might look like:
+
+```json
+{
+  "endpoint": "GET /api/courses",
+  "window": "5m",
+  "latency_ms": {
+    "p50": 45,
+    "p95": 120,
+    "p99": 380,
+    "p99_9": 1200
+  },
+  "request_count": 8432,
+  "error_rate": 0.0012
+}
+```
+
+When p99 is 10x your p50, you have a tail latency problem. That gap usually points to something specific: a missing index, a cold cache, a garbage collection pause, or a single slow downstream dependency.
+
+<Callout type="aha" title="Why p99 matters more than average">
+  <p>Your most active users hit the tail more often. If a user makes 100 API calls per session, they have a 63% chance of hitting the p99 at least once. Your best customers get your worst performance.</p>
+</Callout>
+
+## The four golden signals
+
+Google's SRE book distills all of observability into four signals. For APIs, they map to concrete metrics:
+
+### 1. Latency
+
+How long requests take — but measured as percentiles, not averages. And critically, separate successful requests from failed ones. A fast 500 error shouldn't improve your latency numbers.
+
+```json
+{
+  "signal": "latency",
+  "endpoint": "POST /api/orders",
+  "window": "1m",
+  "success": {
+    "p50_ms": 120,
+    "p95_ms": 340,
+    "p99_ms": 890
+  },
+  "error": {
+    "p50_ms": 15,
+    "p95_ms": 22,
+    "p99_ms": 45
+  }
+}
+```
+
+Notice how errors are faster? That's because they fail early — before doing the real work. If you mix them into the same bucket, errors make your latency look better. That's backwards.
+
+### 2. Traffic
+
+Request volume over time. Tells you what your system is actually doing — and whether something abnormal is happening.
+
+```json
+{
+  "signal": "traffic",
+  "window": "1m",
+  "requests_per_second": 245,
+  "by_endpoint": {
+    "GET /api/courses": 180,
+    "GET /api/users/me": 42,
+    "POST /api/orders": 18,
+    "POST /api/auth/login": 5
+  },
+  "by_status_class": {
+    "2xx": 238,
+    "4xx": 5,
+    "5xx": 2
+  }
+}
+```
+
+A sudden drop in traffic is often worse than a spike. Spikes mean you're popular. Drops mean something is broken upstream and requests aren't reaching you.
+
+### 3. Errors
+
+The rate of failed requests. But "failed" needs a clear definition. Not every 4xx is your fault (client sent bad input), but every 5xx is.
+
+```json
+{
+  "signal": "errors",
+  "window": "5m",
+  "total_requests": 12500,
+  "server_errors_5xx": 23,
+  "server_error_rate": 0.00184,
+  "client_errors_4xx": 156,
+  "by_type": {
+    "500_internal": 12,
+    "502_bad_gateway": 8,
+    "503_service_unavailable": 3,
+    "429_rate_limited": 89,
+    "400_bad_request": 67
+  }
+}
+```
+
+Track 5xx rate as your primary error signal. Alert on it. Track 4xx separately — a spike in 400s might mean you shipped a breaking change and clients are sending the wrong format.
+
+### 4. Saturation
+
+How close your system is to its limits. CPU, memory, connection pools, thread pools, queue depth. Saturation predicts failures before they happen.
+
+```json
+{
+  "signal": "saturation",
+  "timestamp": "2026-04-13T14:30:00Z",
+  "database_pool": {
+    "active_connections": 42,
+    "max_connections": 50,
+    "utilization": 0.84
+  },
+  "event_queue": {
+    "depth": 12500,
+    "max_depth": 50000,
+    "consumer_lag_seconds": 3.2
+  },
+  "memory": {
+    "used_mb": 1840,
+    "limit_mb": 2048,
+    "utilization": 0.90
+  }
+}
+```
+
+When your database connection pool is at 84%, you're not failing yet — but you're one traffic spike away from it. Saturation metrics are your early warning system.
+
+<Callout type="warning" title="The saturation cliff">
+  <p>Saturation doesn't degrade linearly. At 70% utilization, things feel fine. At 85%, latency starts creeping up. At 95%, everything falls off a cliff. Set alerts at 75-80% — not at 95% when it's already too late.</p>
+</Callout>
+
+## Structured logging: metrics you can query
+
+Raw log lines like `[INFO] Request completed in 234ms` are useless at scale. You can't aggregate them, filter them, or build dashboards from them.
+
+Structured logs are JSON events you can query:
+
+```json
+{
+  "timestamp": "2026-04-13T14:32:07.123Z",
+  "level": "info",
+  "service": "order-api",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "method": "POST",
+  "path": "/api/orders",
+  "status": 201,
+  "duration_ms": 234,
+  "user_id": "usr_8a3f",
+  "request_id": "req_k7x9m2",
+  "upstream": {
+    "payment_service_ms": 180,
+    "inventory_service_ms": 32
+  }
+}
+```
+
+Every field is queryable. You can ask: "Show me all requests where `duration_ms > 1000` and `status = 500` and `service = order-api`." You can't do that with plain text logs.
+
+<Callout type="tip" title="The minimum viable log entry">
+  <p>Every API request log should include: timestamp, trace ID, HTTP method, path, status code, duration, and user/client identifier. Everything else is a bonus. Without these seven fields, you're debugging blind.</p>
+</Callout>
+
+## Dashboard checklist
+
+Before you declare your API "observable," make sure you can answer these questions from your dashboards:
+
+- [ ] What's the p50/p95/p99 latency for each endpoint right now?
+- [ ] What's the 5xx error rate over the last hour?
+- [ ] Which endpoint has the highest error rate?
+- [ ] How close are database connections, memory, and CPU to their limits?
+- [ ] Has traffic volume changed significantly compared to the same time yesterday?
+- [ ] Can you filter all of the above by a single trace ID?
+- [ ] Do alerts fire before users notice, not after?
+
+---
+
+*Next up: distributed tracing — following a single request as it bounces across your services.*

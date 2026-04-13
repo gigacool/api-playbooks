@@ -1,0 +1,256 @@
+---
+title: "SDKs, Sandboxes & Mock Servers"
+section: lifecycle
+difficulty: 2
+readMinutes: 5
+hook: Meet developers where they are
+takeaway: SDKs reduce time-to-integration from hours to minutes, and sandbox environments let developers experiment without consequences.
+---
+
+## In a nutshell
+
+An SDK is a library in a specific language (Python, JavaScript, Go) that wraps your API, so developers can make calls with one line of code instead of manually building HTTP requests, handling auth, and parsing responses. A sandbox is a safe copy of your API where developers can experiment without touching real data or incurring real charges. Together, they dramatically reduce the time and effort it takes for someone to start using your API.
+
+## The situation
+
+You've shipped great docs. A Python developer copies your curl example, translates it to `requests`, gets the auth header wrong, debugs for 20 minutes, and finally makes a successful call. A Go developer does the same translation, spending another 30 minutes. Every developer who integrates with your API repeats this friction, in their own language, with their own mistakes.
+
+You're making each developer solve the same problem your team already solved.
+
+## The same call, four languages
+
+Here's a real API call — create a customer — in every major language a developer might use. This is what an SDK eliminates:
+
+### curl
+
+```bash
+curl -X POST https://api.example.com/v1/customers \
+  -H "Authorization: Bearer sk_live_4eC39HqL..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Acme Corp",
+    "email": "billing@acme.com",
+    "metadata": {"plan": "enterprise"}
+  }'
+```
+
+### JavaScript (fetch)
+
+```typescript
+const response = await fetch("https://api.example.com/v1/customers", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer sk_live_4eC39HqL...",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    name: "Acme Corp",
+    email: "billing@acme.com",
+    metadata: { plan: "enterprise" },
+  }),
+});
+
+const customer = await response.json();
+```
+
+### Python (requests)
+
+```python
+import requests
+
+response = requests.post(
+    "https://api.example.com/v1/customers",
+    headers={"Authorization": "Bearer sk_live_4eC39HqL..."},
+    json={
+        "name": "Acme Corp",
+        "email": "billing@acme.com",
+        "metadata": {"plan": "enterprise"},
+    },
+)
+
+customer = response.json()
+```
+
+### Go (net/http)
+
+```go
+payload := map[string]interface{}{
+    "name":     "Acme Corp",
+    "email":    "billing@acme.com",
+    "metadata": map[string]string{"plan": "enterprise"},
+}
+
+body, _ := json.Marshal(payload)
+req, _ := http.NewRequest("POST", "https://api.example.com/v1/customers", bytes.NewBuffer(body))
+req.Header.Set("Authorization", "Bearer sk_live_4eC39HqL...")
+req.Header.Set("Content-Type", "application/json")
+
+resp, err := http.DefaultClient.Do(req)
+```
+
+Now compare all of the above to what an SDK gives you:
+
+```typescript
+// With an SDK
+const customer = await client.customers.create({
+  name: "Acme Corp",
+  email: "billing@acme.com",
+  metadata: { plan: "enterprise" },
+});
+```
+
+One line. Typed. Auto-authenticated. Retries built in. No header juggling.
+
+<Callout type="aha" title="SDKs remove translation work">
+  <p>Every raw HTTP call forces the developer to translate your API into their language, handle auth, parse responses, manage errors, and implement retries. An SDK does all of that once, correctly, so every developer doesn't have to.</p>
+</Callout>
+
+## Auto-generating SDKs from OpenAPI
+
+You don't need to hand-write SDKs for every language. If you have an OpenAPI spec (and after reading this playbook, you should), you can generate them:
+
+```bash
+# Generate a TypeScript client
+npx @openapitools/openapi-generator-cli generate \
+  -i openapi.yaml \
+  -g typescript-fetch \
+  -o ./sdks/typescript
+
+# Generate a Python client
+npx @openapitools/openapi-generator-cli generate \
+  -i openapi.yaml \
+  -g python \
+  -o ./sdks/python
+
+# Generate a Go client
+npx @openapitools/openapi-generator-cli generate \
+  -i openapi.yaml \
+  -g go \
+  -o ./sdks/go
+```
+
+| Approach | Pros | Cons |
+|---|---|---|
+| **Hand-written SDKs** | Best developer experience, idiomatic code, custom error handling | Expensive to maintain, one per language |
+| **Auto-generated SDKs** | Free to produce, always in sync with spec, covers many languages | Generic feel, sometimes awkward APIs, less idiomatic |
+| **No SDK (raw HTTP)** | Zero maintenance, developers use whatever HTTP client they like | Higher friction, every developer re-solves auth/retries |
+
+<Callout type="tip" title="The pragmatic middle ground">
+  <p>Auto-generate SDKs as a baseline, then hand-write a thin wrapper for your top 1-2 languages that adds better types, error classes, and idiomatic patterns. Stripe, Twilio, and AWS all do this — auto-generated core with a polished surface layer.</p>
+</Callout>
+
+## Sandbox environments
+
+A sandbox is a **parallel instance of your API** where developers can experiment without affecting real data, incurring real charges, or breaking anything.
+
+What a good sandbox provides:
+
+- **Same endpoints, same behavior** — the sandbox mirrors production exactly
+- **Test credentials** — separate API keys (`sk_test_...` vs `sk_live_...`)
+- **Pre-seeded data** — sample customers, invoices, products already in the sandbox
+- **Predictable triggers** — magic values that simulate specific scenarios
+
+```bash
+# Sandbox: use test credentials
+curl -X POST https://sandbox.api.example.com/v1/payments \
+  -H "Authorization: Bearer sk_test_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": 5000,
+    "currency": "usd",
+    "card_number": "4242424242424242"
+  }'
+```
+
+```json
+{
+  "id": "pay_test_x9k2",
+  "amount": 5000,
+  "currency": "usd",
+  "status": "succeeded",
+  "sandbox": true,
+  "created_at": "2026-04-13T10:30:00Z"
+}
+```
+
+Magic test values let developers trigger specific outcomes:
+
+| Card number | Behavior |
+|---|---|
+| `4242424242424242` | Always succeeds |
+| `4000000000000002` | Always declines |
+| `4000000000009995` | Insufficient funds |
+| `4000000000000077` | Succeeds, then refund triggers chargeback |
+
+## Mock servers
+
+Sometimes you don't need a full sandbox — you just need a fake API that returns valid responses while you build the client. Mock servers generate responses from your OpenAPI spec, with zero backend infrastructure.
+
+### Prism (Stoplight)
+
+```bash
+# Start a mock server from your OpenAPI spec
+npx @stoplight/prism-cli mock openapi.yaml --port 4010
+```
+
+```bash
+# Hit the mock — it returns valid sample responses
+curl http://localhost:4010/v1/customers/cus_9a3f
+```
+
+```json
+{
+  "id": "cus_9a3f",
+  "name": "string",
+  "email": "user@example.com",
+  "metadata": {},
+  "created_at": "2026-04-13T10:30:00Z"
+}
+```
+
+Prism reads your spec, validates incoming requests against it, and returns realistic sample responses. If you send an invalid request, it rejects it — just like the real API would.
+
+### WireMock (programmable stubs)
+
+For more control, WireMock lets you define exact request-response mappings.
+
+WireMock uses its own response templating syntax. The `${jsonPath ...}` expressions extract values from the incoming request body and echo them back in the response:
+
+```json
+{
+  "request": {
+    "method": "POST",
+    "urlPath": "/v1/customers",
+    "bodyPatterns": [
+      { "matchesJsonPath": "$.name" }
+    ]
+  },
+  "response": {
+    "status": 201,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "id": "cus_mock_001",
+      "name": "${jsonPath request.body '$.name'}",
+      "email": "${jsonPath request.body '$.email'}",
+      "created_at": "2026-04-13T10:30:00Z"
+    }
+  }
+}
+```
+
+| Tool | Best for |
+|---|---|
+| **Prism** | Quick mocking from an existing OpenAPI spec — zero config |
+| **WireMock** | Custom scenarios, stateful mocks, complex test setups |
+| **Mockoon** | Desktop app for local mocking — good for frontend devs |
+| **MSW** (Mock Service Worker) | In-browser mocking for frontend unit tests |
+
+<Callout type="warning" title="Mocks are not tests">
+  <p>Mock servers verify that your client sends the right requests. They don't verify that the real API still behaves the way you expect. Mocks are a development tool, not a testing strategy. For that, you need contract testing.</p>
+</Callout>
+
+---
+
+*Next up: contract testing — the technique that catches breaking changes between services before they reach production.*

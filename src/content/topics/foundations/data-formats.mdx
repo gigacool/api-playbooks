@@ -1,0 +1,185 @@
+---
+title: Data Formats & Content Negotiation
+section: foundations
+difficulty: 1
+readMinutes: 4
+hook: JSON won, but the battle isn't over
+takeaway: JSON is the default for human-facing APIs, but Protocol Buffers, XML, and others exist for good reasons — and content negotiation lets you support multiple formats cleanly.
+---
+
+## In a nutshell
+
+APIs need to send data in some format, and that format affects speed, size, and who can read it. JSON is the default because it's easy for humans and machines. But sometimes you need something smaller (Protocol Buffers), something stricter (XML), or something optimized for huge datasets (CSV, Parquet) -- and HTTP headers let the client and server agree on which format to use.
+
+## The situation
+
+Your API returns JSON. Everyone's happy — until the IoT team says their devices can't afford the parsing overhead. The data pipeline team wants CSV for bulk exports. A partner sends you XML because their system was built in 2008. And the mobile team asks if you can shave bytes off the response because users in emerging markets are on metered connections.
+
+Same data, different constraints, different formats.
+
+## One user, four formats
+
+Here's the same data — a user with a nested address — in each major format.
+
+### JSON
+
+```json
+{
+  "id": "usr_8a3f",
+  "name": "Alice Chen",
+  "email": "alice@example.com",
+  "verified": true,
+  "address": {
+    "street": "42 Oak Avenue",
+    "city": "Portland",
+    "state": "OR",
+    "zip": "97201"
+  }
+}
+```
+
+**Size:** ~210 bytes. Human-readable, universally supported, native to JavaScript. The default for almost every API built after 2010.
+
+### XML
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<user>
+  <id>usr_8a3f</id>
+  <name>Alice Chen</name>
+  <email>alice@example.com</email>
+  <verified>true</verified>
+  <address>
+    <street>42 Oak Avenue</street>
+    <city>Portland</city>
+    <state>OR</state>
+    <zip>97201</zip>
+  </address>
+</user>
+```
+
+**Size:** ~320 bytes. More verbose, but supports schemas (XSD), namespaces, and attributes. Still dominant in enterprise, healthcare (HL7/FHIR), and financial services (ISO 20022).
+
+### Protocol Buffers (binary)
+
+```protobuf
+// user.proto — schema definition
+syntax = "proto3";
+
+message Address {
+  string street = 1;
+  string city = 2;
+  string state = 3;
+  string zip = 4;
+}
+
+message User {
+  string id = 1;
+  string name = 2;
+  string email = 3;
+  bool verified = 4;
+  Address address = 5;
+}
+```
+
+**Size on the wire:** ~95 bytes (binary encoding). Not human-readable, but dramatically smaller and faster to parse. The `.proto` file is the schema AND the documentation. Used by gRPC and for any performance-sensitive internal communication.
+
+### YAML
+
+```yaml
+id: usr_8a3f
+name: Alice Chen
+email: alice@example.com
+verified: true
+address:
+  street: 42 Oak Avenue
+  city: Portland
+  state: OR
+  zip: "97201"
+```
+
+**Size:** ~170 bytes. More readable than JSON (no braces, no quotes on most strings), but whitespace-significant and surprisingly tricky to parse correctly. Used for configuration files and API specifications (OpenAPI, AsyncAPI), rarely for wire formats.
+
+<Callout type="aha" title="Format is a trade-off, not a preference">
+  <p>JSON optimizes for developer experience. Protobuf optimizes for performance. XML optimizes for schema rigor. YAML optimizes for human readability. There's no universal winner — the right format depends on who (or what) is reading the data and how much bandwidth and CPU you can afford.</p>
+</Callout>
+
+## Content negotiation: letting clients choose
+
+HTTP has a built-in mechanism for format negotiation. The client says what it wants; the server says what it's sending.
+
+### The headers
+
+- **`Accept`** — client tells the server what formats it can handle
+- **`Content-Type`** — sender declares the format of the body (request or response)
+
+### In practice
+
+```bash
+# Client requests JSON (the most common case)
+curl -H "Accept: application/json" \
+     https://api.example.com/users/usr_8a3f
+```
+
+```bash
+# Client requests XML
+curl -H "Accept: application/xml" \
+     https://api.example.com/users/usr_8a3f
+```
+
+```bash
+# Client sends JSON, wants JSON back
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -H "Accept: application/json" \
+     -d '{"name": "Alice Chen", "email": "alice@example.com"}' \
+     https://api.example.com/users
+```
+
+```bash
+# Client says "I prefer JSON, but XML is fine too"
+curl -H "Accept: application/json, application/xml;q=0.9" \
+     https://api.example.com/users/usr_8a3f
+```
+
+The `q=0.9` is a **quality factor** — a preference weight from 0 to 1. The server uses it to pick the best match.
+
+### What the server does
+
+1. Parse the `Accept` header
+2. Compare against the formats it supports
+3. Return the best match with the corresponding `Content-Type`
+4. If no match: return `406 Not Acceptable`
+
+<Callout type="tip" title="Keep it simple">
+  <p>Most APIs only support JSON. That's fine. If you only support one format, still set the <code>Content-Type: application/json</code> response header explicitly. Don't leave it to the framework's default behavior — be deliberate about your contract.</p>
+</Callout>
+
+## When to go beyond JSON
+
+| Scenario | Better format | Why |
+|---|---|---|
+| Internal microservice calls (high throughput) | **Protocol Buffers** | 3-10x smaller, 20-100x faster parsing |
+| IoT / embedded devices | **MessagePack / CBOR** | Binary JSON — same structure, smaller size, no parsing overhead |
+| Bulk data export | **CSV / Parquet** | Tabular data for analytics pipelines, much smaller than JSON arrays |
+| Configuration files | **YAML / TOML** | Human-readable, easy to edit by hand |
+| Enterprise / government integration | **XML** | Required by partner systems, schema validation via XSD |
+| Browser-to-server | **JSON** | Native to JavaScript, smallest adoption cost |
+
+<Callout type="warning" title="YAML edge cases will bite you">
+  <p>YAML looks simple but has surprising behavior. <code>NO</code> becomes a boolean <code>false</code>. <code>3.10</code> becomes the float <code>3.1</code>. Norway's country code <code>NO</code> is parsed as <code>false</code>. This is why most APIs use JSON on the wire and YAML only for configuration that humans edit.</p>
+</Callout>
+
+## The pragmatic approach
+
+1. **Default to JSON** for all external and human-facing APIs
+2. **Use Protocol Buffers** when performance matters (internal services, mobile on slow networks)
+3. **Support XML** only when a partner requires it
+4. **Always set `Content-Type`** explicitly in your responses
+5. **Version your content types** if you need to evolve formats: `application/vnd.myapi.v2+json`
+
+Custom media types like `application/vnd.myapi.v2+json` are a powerful but underused feature. They let you version your response format independently from your URL structure — something we'll revisit when we talk about schema evolution.
+
+---
+
+*Next up: specs as source of truth — how OpenAPI, AsyncAPI, and protobuf files turn your API contract from an idea into an enforceable artifact.*

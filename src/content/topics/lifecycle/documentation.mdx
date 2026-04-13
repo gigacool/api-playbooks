@@ -1,0 +1,203 @@
+---
+title: Documentation That Works
+section: lifecycle
+difficulty: 1
+readMinutes: 5
+hook: Time-to-first-successful-call is the only metric that matters
+takeaway: Great API documentation shows, not tells — concrete examples with real curl commands and JSON payloads beat abstract descriptions every time.
+---
+
+## In a nutshell
+
+API documentation is how developers figure out how to use your API. The difference between good and bad docs isn't length -- it's whether a developer can copy a concrete example, run it, and get a successful response in under five minutes. Show real curl commands, full JSON payloads, and actual error responses. Abstract descriptions like "accepts the required parameters" help nobody.
+
+## The situation
+
+A developer evaluates your API. They open the docs. They see "Accepts a JSON body with the required parameters and returns the created resource." They stare at it. What parameters? What format? What does the response look like? They open Postman, guess at the payload, hit 422 three times, and then find a competitor with better docs.
+
+You just lost a user because your documentation described the API instead of demonstrating it.
+
+## Bad docs vs good docs
+
+The difference between documentation that works and documentation that doesn't isn't length. It's **specificity**.
+
+### Bad: abstract description
+
+> **POST /api/invoices**
+>
+> Creates a new invoice. Accepts invoice data in the request body. Returns the created invoice object. Authentication required.
+
+This tells you almost nothing. What fields are required? What format is the date? What does the response actually look like? You're forced to reverse-engineer the API through trial and error.
+
+### Good: concrete example
+
+**POST /api/invoices** — Create a new invoice
+
+Requires `Authorization: Bearer <token>` header. Returns `201 Created` on success.
+
+```bash
+curl -X POST https://api.example.com/v1/invoices \
+  -H "Authorization: Bearer sk_live_4eC39HqL..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "cus_9a3f",
+    "due_date": "2026-05-15",
+    "line_items": [
+      {
+        "description": "Consulting — April 2026",
+        "quantity": 40,
+        "unit_price": 15000
+      }
+    ],
+    "currency": "usd",
+    "memo": "Payment due within 30 days"
+  }'
+```
+
+```json
+{
+  "id": "inv_x7k9",
+  "status": "draft",
+  "customer_id": "cus_9a3f",
+  "due_date": "2026-05-15",
+  "currency": "usd",
+  "line_items": [
+    {
+      "id": "li_3b8a",
+      "description": "Consulting — April 2026",
+      "quantity": 40,
+      "unit_price": 15000,
+      "amount": 600000
+    }
+  ],
+  "subtotal": 600000,
+  "total": 600000,
+  "memo": "Payment due within 30 days",
+  "created_at": "2026-04-13T10:30:00Z"
+}
+```
+
+The developer copies this, changes the values, and makes a successful call in under 60 seconds.
+
+<Callout type="aha" title="Time-to-first-successful-call">
+  <p>Stripe measures developer experience by how quickly someone goes from reading the docs to making a successful API call. Everything in their documentation is optimized for this metric — real API keys in the dashboard, copy-paste curl commands, inline response previews. If your docs don't get someone to a working call in under 5 minutes, they're not working.</p>
+</Callout>
+
+## Anatomy of a well-documented endpoint
+
+Every endpoint in your API should document these elements:
+
+### 1. Description and purpose
+
+One sentence. What does this endpoint do and when would you use it?
+
+### 2. Authentication
+
+What credentials are needed? Header format? Scopes required?
+
+### 3. Request
+
+```bash
+POST /v1/invoices
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `customer_id` | string | Yes | The ID of the customer to invoice |
+| `due_date` | string (ISO 8601) | Yes | Payment due date (`YYYY-MM-DD`) |
+| `line_items` | array | Yes | At least one line item required |
+| `line_items[].description` | string | Yes | What the charge is for |
+| `line_items[].quantity` | integer | Yes | Number of units |
+| `line_items[].unit_price` | integer | Yes | Price per unit in cents |
+| `currency` | string | No | Three-letter ISO currency code. Default: `usd` |
+| `memo` | string | No | Internal note displayed on the invoice |
+
+### 4. Response
+
+Show the full response body — not a truncated version, not a schema diagram. The actual JSON a developer will receive.
+
+### 5. Error cases
+
+This is where most docs fall short. Don't just list status codes — show the error payloads:
+
+```bash
+# Missing required field
+curl -X POST https://api.example.com/v1/invoices \
+  -H "Authorization: Bearer sk_live_4eC39HqL..." \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "cus_9a3f"}'
+```
+
+```json
+{
+  "error": {
+    "type": "validation_error",
+    "message": "Missing required field: due_date",
+    "code": "missing_required_field",
+    "param": "due_date",
+    "doc_url": "https://docs.example.com/errors#missing_required_field"
+  }
+}
+```
+
+```json
+// 404 — Customer not found
+{
+  "error": {
+    "type": "not_found",
+    "message": "No customer found with ID 'cus_invalid'",
+    "code": "resource_not_found",
+    "param": "customer_id"
+  }
+}
+```
+
+```json
+// 401 — Invalid or expired token
+{
+  "error": {
+    "type": "authentication_error",
+    "message": "Invalid API key provided",
+    "code": "invalid_api_key"
+  }
+}
+```
+
+<Callout type="tip" title="Show errors, don't just list them">
+  <p>Developers spend more time debugging errors than writing happy-path code. If your docs only show the success case, they'll hit a 422 and have no idea what went wrong. Document every error a developer is likely to encounter, with the exact response body they'll see.</p>
+</Callout>
+
+## Why examples beat descriptions
+
+API documentation has a fundamental asymmetry: **producers think in abstractions, consumers think in examples**. The team that built the API knows what "accepts invoice data" means. The developer trying to use it doesn't.
+
+| What producers write | What consumers need |
+|---|---|
+| "Accepts a date string" | `"due_date": "2026-05-15"` (ISO 8601, date only) |
+| "Returns the created resource" | The full 20-field JSON response body |
+| "Authentication required" | `Authorization: Bearer sk_live_...` |
+| "Amount in smallest currency unit" | `15000` means $150.00 |
+| "Pagination supported" | `?cursor=eyJpZCI6MTIzfQ&limit=25` |
+
+Every ambiguity in your documentation becomes a support ticket.
+
+## The documentation checklist
+
+For every endpoint, verify:
+
+- [ ] A copy-paste curl command that works (with realistic sample data)
+- [ ] Full request body with every field documented (type, required, default, constraints)
+- [ ] Full response body — the actual JSON, not a schema
+- [ ] Every error response the endpoint can return, with payloads
+- [ ] Authentication requirements (header format, required scopes)
+- [ ] Rate limit information (if applicable)
+- [ ] At least one real-world use case ("Use this when...")
+- [ ] Links to related endpoints ("After creating an invoice, send it with POST /v1/invoices/{id}/send")
+
+<Callout type="warning" title="Docs rot faster than code">
+  <p>Documentation that's wrong is worse than no documentation. If your docs live in a wiki disconnected from your codebase, they will drift. Generate what you can from your OpenAPI spec. Test your code examples in CI. Treat a broken example like a broken test.</p>
+</Callout>
+
+---
+
+*Next up: SDKs, sandboxes, and mock servers — because curl is just the starting point, and developers want to work in their own language.*
