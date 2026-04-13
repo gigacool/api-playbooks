@@ -48,11 +48,17 @@ export default function Home() {
         </p>
         <div className="flex items-center gap-4 mt-8">
           <Link
-            href={`/${sections[0].slug}/${sections[0].topics[0].slug}`}
+            href="/top-10"
             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors"
           >
-            Start reading
+            Get started
             <ArrowRight className="w-4 h-4" />
+          </Link>
+          <Link
+            href={`/${sections[0].slug}/${sections[0].topics[0].slug}`}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg border border-border font-medium text-sm hover:bg-accent transition-colors"
+          >
+            Browse topics
           </Link>
         </div>
       </div>
@@ -146,7 +152,7 @@ export default function Home() {
 
       <div className="mt-16 text-center text-sm text-muted-foreground">
         Built by{" "}
-        <span className="font-medium text-foreground">Noosia Digital</span>
+        <a href="https://noosia.digital" target="_blank" rel="noopener noreferrer" className="font-medium text-foreground hover:text-primary transition-colors">Noosia Digital</a>
         {" "}&mdash; learning experiences that stick.
       </div>
     </div>

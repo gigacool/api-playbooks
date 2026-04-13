@@ -137,7 +137,7 @@ function ClosingSlide() {
       </div>
       <p className="mt-12 text-sm text-muted-foreground">
         Built by{" "}
-        <span className="font-medium text-foreground">Noosia Digital</span>
+        <a href="https://noosia.digital" target="_blank" rel="noopener noreferrer" className="font-medium text-foreground hover:text-primary transition-colors">Noosia Digital</a>
         {" "}&mdash; learning experiences that stick.
       </p>
     </div>
@@ -284,7 +284,7 @@ export function Top10Content() {
 
       <div className="mt-8 text-center text-sm text-muted-foreground">
         Built by{" "}
-        <span className="font-medium text-foreground">Noosia Digital</span>
+        <a href="https://noosia.digital" target="_blank" rel="noopener noreferrer" className="font-medium text-foreground hover:text-primary transition-colors">Noosia Digital</a>
         {" "}&mdash; learning experiences that stick.
       </div>
     </div>

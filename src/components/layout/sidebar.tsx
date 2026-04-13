@@ -205,10 +205,15 @@ export function Sidebar() {
           </div>
         </nav>
       </ScrollArea>
-      <div className="p-4 border-t border-border">
+      <div className="p-4 border-t border-border space-y-1">
         <p className="text-xs text-muted-foreground text-center">
           Built by{" "}
-          <span className="font-medium text-foreground">Noosia Digital</span>
+          <a href="https://noosia.digital" target="_blank" rel="noopener noreferrer" className="font-medium text-foreground hover:text-primary transition-colors">Noosia Digital</a>
+        </p>
+        <p className="text-[10px] text-muted-foreground/60 text-center">
+          <Link href="/privacy" className="hover:text-muted-foreground transition-colors">Privacy</Link>
+          {" "}&middot;{" "}
+          <Link href="/terms" className="hover:text-muted-foreground transition-colors">Terms</Link>
         </p>
       </div>
     </aside>
