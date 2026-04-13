@@ -17,6 +17,7 @@ import {
   Repeat,
   Bot,
   BookOpen,
+  Flame,
   ChevronDown,
   type LucideIcon,
 } from "lucide-react";
@@ -85,6 +86,20 @@ export function Sidebar() {
       </div>
       <ScrollArea className="flex-1">
         <nav className="p-2">
+          {/* Top 10 Commandments */}
+          <Link
+            href="/top-10"
+            className={cn(
+              "w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors mb-2",
+              pathname === "/top-10"
+                ? "bg-primary text-primary-foreground"
+                : "text-foreground hover:bg-accent hover:text-accent-foreground"
+            )}
+          >
+            <Flame className="w-4 h-4 shrink-0" />
+            <span className="flex-1 text-left">10 API Commandments</span>
+          </Link>
+          <Separator className="mb-2" />
           {sections.map((section) => {
             const Icon = iconMap[section.icon] || Blocks;
             const isExpanded = expandedSections.has(section.slug);
